@@ -20,15 +20,19 @@
 #
 # Every key stays a normal Outline key (ss:// access URL, works in the Outline Client) and ALL keys share ONE port, just
 # like all WireGuard peers share one UDP port. What this script adds on top of the stock Outline server (Shadowbox):
-#   1. traffic that is kept            (usage per key is read from outline-ss-server's counters and saved on disk)
+#   1. traffic that is kept            (every key gets an inner IP on the virtual interface "outline"; the kernel counts its
+#                                       traffic per key and the totals are saved on disk)
 #   2. one device per key              (the newest device wins, the older one is cut off at once - like WireGuard)
 #   3. online / last seen              3.1 live upload / download rate per key
 #   4. time limit per key              (date, duration from now, duration after first connection, or none)
 #   5. usage per key                   (upload, download, total, optional data limit)
-#   6. pause / resume a key            7. edit a key (name, traffic, time limit)
+#   6. pause / resume a key            (inner IP dropped by the firewall; rules are rebuilt at boot before Docker starts)
+#   7. edit a key (name, traffic, time limit)
 # Shadowsocks has no handshake and no inner IP, so "which device is using this key" can only be decided inside the proxy,
 # where the key and the client address are known together. That is what the small patch to outline-ss-server does; this
-# script builds it on your server (in a temporary Go container) and mounts it into the Shadowbox container.
+# script builds it on your server (in a temporary Go container) and mounts it into the Shadowbox container. The patched proxy
+# sends each key's outgoing traffic from that key's inner IP (10.250.x.y on interface "outline", NAT to the internet), which is
+# what lets the kernel count and block per key. Targets that are IPv6-only are not reachable through keys in this mode.
 # Watchtower is NOT started: an automatic image update would replace the patched binary's matching Shadowbox.
 #
 # You may set the following environment variables, overriding their defaults:
@@ -46,12 +50,13 @@
 #     (edit it with: vi ${SHADOWBOX_DIR}/panel/config.json, then: systemctl restart outline-panel).
 # GUARD_IMAGE: Docker image used once to compile the patched outline-ss-server (default golang:1.23-alpine).
 # GUARD_DIR: Where the patched binary is kept (default ${SHADOWBOX_DIR}/guard).
+# EGRESS_POOL: Inner addresses of the keys, one /32 per key (default 10.250.0.0/16). Nothing else here may use it.
 #
 # Deprecated:
 # SB_PUBLIC_IP: Use the --hostname flag instead
 # SB_API_PORT: Use the --api-port flag instead
 
-# Requires curl and docker to be installed (python3 is installed by this script when missing)
+# Requires curl and docker to be installed (python3, iproute2 and iptables are installed by this script when missing)
 
 set -euo pipefail
 
@@ -400,6 +405,9 @@ docker_command=(
   -e "SB_CERTIFICATE_FILE=${SB_CERTIFICATE_FILE}"
   -e "SB_PRIVATE_KEY_FILE=${SB_PRIVATE_KEY_FILE}"
 
+  # Device guard: a key is refused until the key panel has registered it (fail closed - also right after a reboot).
+  -e "OUTLINE_GUARD_REQUIRE_EGRESS=1"
+
   # Where to report metrics to, if opted-in.
   -e "SB_METRICS_URL=${SB_METRICS_URL:-}"
 
@@ -531,7 +539,7 @@ function build_guard() {
   cat > "${GUARD_DIR}/guard.patch" <<'OUTLINE_GUARD_PATCH_END'
 diff -uN a/cmd/outline-ss-server/main.go b/cmd/outline-ss-server/main.go
 --- a/cmd/outline-ss-server/main.go	2026-10-29 19:39:16.168557849 -0700
-+++ b/cmd/outline-ss-server/main.go	2026-10-29 19:44:26.535116277 -0700
++++ b/cmd/outline-ss-server/main.go	2026-10-29 20:31:15.545625616 -0700
 @@ -379,6 +379,8 @@
  
  	if flags.MetricsAddr != "" {
@@ -543,8 +551,8 @@ diff -uN a/cmd/outline-ss-server/main.go b/cmd/outline-ss-server/main.go
  		}()
 diff -uN a/service/deviceguard.go b/service/deviceguard.go
 --- a/service/deviceguard.go	1969-12-31 16:00:00.000000000 -0800
-+++ b/service/deviceguard.go	2026-10-29 19:44:26.540516278 -0700
-@@ -0,0 +1,372 @@
++++ b/service/deviceguard.go	2026-10-29 20:31:15.546907092 -0700
+@@ -0,0 +1,419 @@
 +// Copyright 2026 Mithra Corp.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -592,6 +600,7 @@ diff -uN a/service/deviceguard.go b/service/deviceguard.go
 +	keys          map[string]*keyGuard
 +	startedAt     time.Time
 +	defaultSingle bool
++	requireEgress bool // fail closed: a key without an egress address is refused (set OUTLINE_GUARD_REQUIRE_EGRESS=1)
 +	releaseAfter  time.Duration
 +	now           func() time.Time
 +	nextSession   uint64
@@ -604,7 +613,8 @@ diff -uN a/service/deviceguard.go b/service/deviceguard.go
 +
 +type keyGuard struct {
 +	blocked     bool
-+	single      *bool // nil: use the guard's default
++	egress      netip.Addr // inner address this key's outgoing traffic is sent from (invalid: not set)
++	single      *bool      // nil: use the guard's default
 +	owner       string
 +	ownerIdle   time.Time // when the owner's last session closed; zero while it has sessions
 +	blockedDevs map[string]time.Time
@@ -637,7 +647,9 @@ diff -uN a/service/deviceguard.go b/service/deviceguard.go
 +	if v, err := strconv.Atoi(os.Getenv("OUTLINE_GUARD_RELEASE_SECONDS")); err == nil && v >= 0 {
 +		release = time.Duration(v) * time.Second
 +	}
-+	return NewDeviceGuard(single, release)
++	g := NewDeviceGuard(single, release)
++	g.requireEgress = os.Getenv("OUTLINE_GUARD_REQUIRE_EGRESS") == "1"
++	return g
 +}
 +
 +// DeviceID turns a client address into the identity of its device: an IPv4 address as is, an IPv6 address as its /64
@@ -710,6 +722,10 @@ diff -uN a/service/deviceguard.go b/service/deviceguard.go
 +	if k.blocked {
 +		g.mu.Unlock()
 +		return func() {}, false, "key_blocked"
++	}
++	if g.requireEgress && !k.egress.IsValid() {
++		g.mu.Unlock()
++		return func() {}, false, "no_egress"
 +	}
 +	if dev == "" {
 +		g.mu.Unlock()
@@ -825,6 +841,27 @@ diff -uN a/service/deviceguard.go b/service/deviceguard.go
 +	}
 +}
 +
++// SetEgress sets the inner address that the key's outgoing connections are bound to; the zero Addr clears it.
++//
++// Usage: g.SetEgress("3", netip.MustParseAddr("10.250.0.5"))
++func (g *DeviceGuard) SetEgress(keyID string, addr netip.Addr) {
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	g.keyLocked(keyID).egress = addr
++}
++
++// Egress returns the inner address of a key (the zero Addr when none is set).
++//
++// Usage: if a := g.Egress(keyID); a.IsValid() { dialer.LocalAddr = &net.TCPAddr{IP: a.AsSlice()} }
++func (g *DeviceGuard) Egress(keyID string) netip.Addr {
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	if k := g.keys[keyID]; k != nil {
++		return k.egress
++	}
++	return netip.Addr{}
++}
++
 +// Forget drops everything known about a key (call it when the key is deleted).
 +//
 +// Usage: g.Forget("3")
@@ -843,6 +880,7 @@ diff -uN a/service/deviceguard.go b/service/deviceguard.go
 +	Sessions       int      `json:"sessions"`
 +	BlockedDevices []string `json:"blockedDevices"`
 +	LastSeen       int64    `json:"lastSeen"`
++	Egress         string   `json:"egress"`
 +}
 +
 +// Snapshot returns the state of every key the guard has seen or been told about.
@@ -862,8 +900,12 @@ diff -uN a/service/deviceguard.go b/service/deviceguard.go
 +		if !k.lastSeen.IsZero() {
 +			seen = k.lastSeen.Unix()
 +		}
++		eg := ""
++		if k.egress.IsValid() {
++			eg = k.egress.String()
++		}
 +		out[id] = KeyStatus{Blocked: k.blocked, SingleDevice: g.singleLocked(k), Owner: k.owner,
-+			Sessions: len(k.sessions), BlockedDevices: devs, LastSeen: seen}
++			Sessions: len(k.sessions), BlockedDevices: devs, LastSeen: seen, Egress: eg}
 +	}
 +	return out
 +}
@@ -871,7 +913,7 @@ diff -uN a/service/deviceguard.go b/service/deviceguard.go
 +// Handler serves the control interface. Mount it on the (local) metrics address:
 +//
 +//	GET    /guard/keys        -> {"startedAt": unix, "defaultSingleDevice": bool, "keys": {"<id>": KeyStatus, ...}}
-+//	PUT    /guard/keys/<id>   {"blocked": bool, "singleDevice": bool|null}  (either field may be left out)
++//	PUT    /guard/keys/<id>   {"blocked": bool, "singleDevice": bool|null, "egress": "10.250.0.5"|""}  (any field may be left out)
 +//	DELETE /guard/keys/<id>   forget the key
 +func (g *DeviceGuard) Handler() http.Handler {
 +	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -888,10 +930,23 @@ diff -uN a/service/deviceguard.go b/service/deviceguard.go
 +			var body struct {
 +				Blocked      *bool           `json:"blocked"`
 +				SingleDevice json.RawMessage `json:"singleDevice"`
++				Egress       *string         `json:"egress"`
 +			}
 +			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
 +				http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
 +				return
++			}
++			if body.Egress != nil {
++				var addr netip.Addr
++				if *body.Egress != "" {
++					a, err := netip.ParseAddr(*body.Egress)
++					if err != nil || !a.Is4() {
++						http.Error(w, `{"error":"egress must be an IPv4 address or empty"}`, http.StatusBadRequest)
++						return
++					}
++					addr = a
++				}
++				g.SetEgress(path, addr)
 +			}
 +			if body.SingleDevice != nil {
 +				var single *bool
@@ -919,8 +974,25 @@ diff -uN a/service/deviceguard.go b/service/deviceguard.go
 +}
 diff -uN a/service/tcp.go b/service/tcp.go
 --- a/service/tcp.go	2026-10-29 19:39:16.162498601 -0700
-+++ b/service/tcp.go	2026-10-29 19:44:26.529820718 -0700
-@@ -345,6 +345,12 @@
++++ b/service/tcp.go	2026-10-29 20:31:15.542646721 -0700
+@@ -183,6 +183,16 @@
+ 	}}}
+ }
+ 
++// makeValidatingTCPStreamDialerFrom is makeValidatingTCPStreamDialer with outgoing connections bound to a local address.
++//
++// Usage: d := makeValidatingTCPStreamDialerFrom(onet.RequirePublicIP, netip.MustParseAddr("10.77.0.5"))
++func makeValidatingTCPStreamDialerFrom(targetIPValidator onet.TargetIPValidator, local netip.Addr) transport.StreamDialer {
++	return &transport.TCPDialer{Dialer: net.Dialer{LocalAddr: &net.TCPAddr{IP: local.AsSlice()}, Control: func(network, address string, c syscall.RawConn) error {
++		ip, _, _ := net.SplitHostPort(address)
++		return targetIPValidator(net.ParseIP(ip))
++	}}}
++}
++
+ // StreamHandler is a handler that handles stream connections.
+ type StreamHandler interface {
+ 	Handle(ctx context.Context, conn transport.StreamConn, connMetrics TCPConnMetrics)
+@@ -345,6 +355,12 @@
  		h.absorbProbe(outerConn, connMetrics, authErr.Status, proxyMetrics)
  		return authErr
  	}
@@ -933,10 +1005,35 @@ diff -uN a/service/tcp.go b/service/tcp.go
  	connMetrics.AddAuthenticated(id)
  
  	// Read target address and dial it.
+@@ -357,8 +373,13 @@
+ 		return onet.NewConnectionError("ERR_READ_ADDRESS", "Failed to get target address", err)
+ 	}
+ 
++	// Device guard: connect to the target from the key's inner address, so the kernel can count and block per key.
++	targetDialer := h.dialer
++	if eg := DefaultDeviceGuard.Egress(id); eg.IsValid() && h.dialer == defaultDialer {
++		targetDialer = makeValidatingTCPStreamDialerFrom(onet.RequirePublicIP, eg)
++	}
+ 	dialer := transport.FuncStreamDialer(func(ctx context.Context, addr string) (transport.StreamConn, error) {
+-		tgtConn, err := h.dialer.DialStream(ctx, tgtAddr)
++		tgtConn, err := targetDialer.DialStream(ctx, tgtAddr)
+ 		if err != nil {
+ 			return nil, err
+ 		}
 diff -uN a/service/udp.go b/service/udp.go
 --- a/service/udp.go	2026-10-29 19:39:16.165503995 -0700
-+++ b/service/udp.go	2026-10-29 19:44:26.533021590 -0700
-@@ -188,8 +188,17 @@
++++ b/service/udp.go	2026-10-29 20:31:15.543971882 -0700
+@@ -184,12 +184,26 @@
+ 					return onetErr
+ 				}
+ 
+-				udpConn, err := net.ListenPacket("udp", "")
++				// Device guard: send to targets from the key's inner address (see DeviceGuard.SetEgress).
++				listenAddr := ""
++				if eg := DefaultDeviceGuard.Egress(keyID); eg.IsValid() {
++					listenAddr = net.JoinHostPort(eg.String(), "0")
++				}
++				udpConn, err := net.ListenPacket("udp", listenAddr)
  				if err != nil {
  					return onet.NewConnectionError("ERR_CREATE_SOCKET", "Failed to create UDP socket", err)
  				}
@@ -955,7 +1052,7 @@ diff -uN a/service/udp.go b/service/udp.go
  				unpackStart := time.Now()
  				textData, err := shadowsocks.Unpack(nil, cipherData, targetConn.cryptoKey)
  				timeToCipher := time.Since(unpackStart)
-@@ -364,13 +373,16 @@
+@@ -364,13 +378,16 @@
  	return nil
  }
  
@@ -1033,25 +1130,58 @@ function disable_watchtower() {
 # Key panel
 # ---------------------------------------------------------------------------------------------------------------------
 
-# Usage: install_panel_requirements -> installs python3 when it is missing
+# Usage: panel_pkg <python3|ip|iptables> -> prints the package that provides it for the package manager PKG_MANAGER
+function panel_pkg() {
+  case "$1:${PKG_MANAGER}" in
+    python3:pacman)  echo python ;;
+    python3:*)       echo python3 ;;
+    ip:dnf|ip:yum)   echo iproute ;;
+    ip:*)            echo iproute2 ;;
+    iptables:*)      echo iptables ;;
+  esac
+}
+
+# Usage: install_panel_requirements -> installs python3, ip (iproute2) and iptables when they are missing
 function install_panel_requirements() {
-  command_exists python3 && return 0
-  local pm="" tool
-  for tool in apt-get dnf yum apk pacman zypper; do
-    if command_exists "${tool}"; then pm="${tool}"; break; fi
+  local -a missing=()
+  local tool
+  for tool in python3 ip iptables; do
+    command_exists "${tool}" || missing+=("${tool}")
   done
-  if [[ -z "${pm}" ]]; then
-    log_error "Please install python3 first, then run this script again."
+  if (( ${#missing[@]} == 0 )); then
+    return 0
+  fi
+  PKG_MANAGER=""
+  for tool in apt-get dnf yum apk pacman zypper; do
+    if command_exists "${tool}"; then PKG_MANAGER="${tool}"; break; fi
+  done
+  if [[ -z "${PKG_MANAGER}" ]]; then
+    log_error "Please install these first, then run this script again: ${missing[*]}"
     return 1
   fi
-  case "${pm}" in
-    apt-get) DEBIAN_FRONTEND=noninteractive apt-get update -qq >&2 && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 >&2 ;;
-    dnf|yum) "${pm}" install -y -q python3 >&2 ;;
-    apk)     apk add --quiet python3 >&2 ;;
-    pacman)  pacman -S --noconfirm --needed python >&2 ;;
-    zypper)  zypper --non-interactive install python3 >&2 ;;
+  local -a packages=()
+  for tool in "${missing[@]}"; do
+    packages+=("$(panel_pkg "${tool}")")
+  done
+  case "${PKG_MANAGER}" in
+    apt-get) DEBIAN_FRONTEND=noninteractive apt-get update -qq >&2 && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${packages[@]}" >&2 ;;
+    dnf|yum) "${PKG_MANAGER}" install -y -q "${packages[@]}" >&2 ;;
+    apk)     apk add --quiet "${packages[@]}" >&2 ;;
+    pacman)  pacman -S --noconfirm --needed "${packages[@]}" >&2 ;;
+    zypper)  zypper --non-interactive install "${packages[@]}" >&2 ;;
   esac
-  command_exists python3 || { log_error "Could not install python3"; return 1; }
+  for tool in python3 ip iptables; do
+    command_exists "${tool}" || { log_error "Could not install ${tool}"; return 1; }
+  done
+}
+
+# Usage: check_egress_pool -> stops when a route inside the inner address pool (EGRESS_POOL) already exists on this machine
+function check_egress_pool() {
+  local prefix="${EGRESS_POOL%.*.*/*}"
+  if ip -4 -o route show 2>/dev/null | grep -v " dev ${EGRESS_INTERFACE} " | grep -q "^${prefix}\."; then
+    log_error "Routes inside ${EGRESS_POOL} already exist on this machine. Run again with EGRESS_POOL=<another private /16, e.g. 10.88.0.0/16>."
+    return 1
+  fi
 }
 
 # Usage: read_keys_port -> sets KEYS_PORT: the one port new access keys use (asked from Shadowbox through the panel)
@@ -1094,29 +1224,33 @@ function write_panel_files() {
 # the ss:// access URL works in the Outline Client.
 #
 # What it adds on top of Shadowbox:
-#   1. Traffic that is kept: per-key totals come from the byte counters of the patched outline-ss-server and are saved to
-#      disk, so they survive restarts of the server, of Docker and of the VPS.
+#   1. Traffic that is kept: every key gets an inner IP (10.250.x.y) on the virtual interface "outline"; the patched
+#      outline-ss-server sends that key's traffic to the internet from that address, so the kernel counts it per key.
+#      Totals are saved to disk and survive restarts of the server, of Docker and of the VPS.
 #   2. One device per key: enforced inside the patched outline-ss-server ("device guard"): the newest device (client address)
 #      wins, the older one is cut off at once - the same way WireGuard drops the first device when a second one uses the key.
 #   3. Online / last seen: derived from the last traffic of the key (Shadowsocks has no handshake).
 #   3.1 Live upload / download rate per key.
 #   4. Time limit: a date, a duration from now, a duration after the first connection, or none.
 #   5. Usage per key: upload, download, total, with an optional data limit.
-#   6. Pause / resume.   7. Edit (name, traffic, time limit) - PATCH /access-keys/<id>.
+#   6. Pause / resume: the key's inner IP is dropped by the firewall (rules are rebuilt at boot, before Docker starts)
+#      and the proxy closes its connections.   7. Edit (name, traffic, time limit) - PATCH /access-keys/<id>.
 #
 # The panel answers on the public API port with Outline's own URL layout (https://host:port/<secret>/access-keys ...).
 # Routes it does not know are forwarded unchanged to Shadowbox, which listens on a private port.
 #
-# Needs: python3 (3.6+), the patched outline-ss-server (see install_server.sh). Standard library only.
+# Needs: python3 (3.6+), iproute2 (ip), iptables, the patched outline-ss-server (see install_server.sh). Standard library only.
 # Config: /opt/outline/panel/config.json (edit it with: vi /opt/outline/panel/config.json), state: state.json next to it.
 
 import calendar
 import collections
 import datetime
+import ipaddress
 import json
 import logging
 import os
 import re
+import shutil
 import signal
 import socket
 import ssl
@@ -1128,7 +1262,7 @@ import http.client
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
-VERSION = '2.0.0'
+VERSION = '3.0.0'
 log = logging.getLogger('outline-panel')
 
 DEFAULTS = {
@@ -1142,6 +1276,9 @@ DEFAULTS = {
     'online_window_seconds': 180,     # "online" = traffic within this many seconds
     'single_device': True,            # default for new keys (the guard itself starts from OUTLINE_GUARD_SINGLE_DEVICE)
     'save_seconds': 10,
+    'egress': True,                   # give every key an inner IP on a virtual interface (kernel counters + blocks)
+    'egress_interface': 'outline',    # name of the virtual interface
+    'egress_pool': '10.250.0.0/16',    # inner addresses of the keys (one /32 per key)
 }
 
 
@@ -1459,6 +1596,103 @@ class Shadowbox(object):
 
 
 # ----------------------------------------------------------------------------------------------------------------------
+# the virtual interface "outline": one inner IP per key, kernel counters and blocks
+# ----------------------------------------------------------------------------------------------------------------------
+
+class Egress(object):
+    CH_OUT, CH_IN = 'OUTLINE-OUT', 'OUTLINE-IN'
+
+    # Usage: Egress(cfg) -> controls the interface cfg["egress_interface"], its /32 addresses taken from cfg["egress_pool"],
+    #        and the iptables chains OUTLINE-OUT / OUTLINE-IN (per-key counters and DROP rules) plus one MASQUERADE rule
+    def __init__(self, cfg):
+        self.iface = cfg['egress_interface']
+        self.pool = ipaddress.ip_network(cfg['egress_pool'])
+        self.ok = all(shutil.which(b) for b in ('ip', 'iptables', 'iptables-save', 'iptables-restore'))
+        self.sig = None          # what the firewall currently holds: sorted [(ip, blocked)]
+        self.last_repair = 0
+
+    # Usage: self._ipt(["-t", "nat", "-S"]) -> (returncode, stdout, stderr) of iptables
+    def _ipt(self, args):
+        return run(['iptables', '-w'] + args)
+
+    # Usage: self.ensure(now) -> creates the interface, chains, jumps and NAT rule when missing (checked every 30 s);
+    #        True when anything had to be created (the per-key rules must then be written again)
+    def ensure(self, now, force=False):
+        if not force and now - self.last_repair < 30:
+            return False
+        self.last_repair = now
+        changed = False
+        if run(['ip', 'link', 'show', self.iface])[0] != 0:
+            if run(['ip', 'link', 'add', self.iface, 'type', 'dummy'])[0] != 0:
+                rc, _, err = run(['ip', 'link', 'add', self.iface, 'type', 'bridge'])
+                if rc != 0:
+                    log.error('cannot create interface %s: %s', self.iface, err.strip())
+                    return False
+            changed = True
+        run(['ip', 'link', 'set', self.iface, 'up'])
+        for ch in (self.CH_OUT, self.CH_IN):
+            if self._ipt(['-L', ch, '-n'])[0] != 0:
+                self._ipt(['-N', ch])
+                changed = True
+        for parent, ch in (('OUTPUT', self.CH_OUT), ('INPUT', self.CH_IN)):
+            if self._ipt(['-C', parent, '-j', ch])[0] != 0:
+                self._ipt(['-I', parent, '1', '-j', ch])
+                changed = True
+        nat = ['POSTROUTING', '-s', str(self.pool), '!', '-o', self.iface, '-j', 'MASQUERADE']
+        if self._ipt(['-t', 'nat', '-C'] + nat)[0] != 0:
+            self._ipt(['-t', 'nat', '-A'] + nat)
+            changed = True
+        if changed:
+            self.sig = None
+        return changed
+
+    # Usage: self.addresses() -> set of the inner addresses currently on the interface (only those inside the pool)
+    def addresses(self):
+        out = set()
+        for m in re.finditer(r'inet (\d+\.\d+\.\d+\.\d+)/', run(['ip', '-4', '-o', 'addr', 'show', 'dev', self.iface])[1]):
+            if ipaddress.ip_address(m.group(1)) in self.pool:
+                out.add(m.group(1))
+        return out
+
+    # Usage: self.sync_addresses({"10.250.0.2", ...}) -> adds missing and removes stale /32 addresses of the interface
+    def sync_addresses(self, wanted):
+        have = self.addresses()
+        for ip in sorted(wanted - have):
+            run(['ip', 'addr', 'add', ip + '/32', 'dev', self.iface])
+        for ip in sorted(have - wanted):
+            run(['ip', 'addr', 'del', ip + '/32', 'dev', self.iface])
+
+    # Usage: self.apply({"10.250.0.2": False, "10.250.0.3": True}) -> True when the per-key rules were written: counting rules for
+    #        keys that are allowed, DROP rules for blocked ones (all counters restart at 0 - the caller must read them first)
+    def apply(self, blocked):
+        sig = sorted(blocked.items())
+        if sig == self.sig:
+            return False
+        lines = ['*filter', ':%s - [0:0]' % self.CH_OUT, ':%s - [0:0]' % self.CH_IN]
+        for ip, b in sig:
+            lines.append('-A %s -s %s/32%s' % (self.CH_OUT, ip, ' -j DROP' if b else ''))
+            lines.append('-A %s -d %s/32%s' % (self.CH_IN, ip, ' -j DROP' if b else ''))
+        lines.append('COMMIT\n')
+        rc, _, err = run(['iptables-restore', '-w', '--noflush'], '\n'.join(lines))
+        if rc != 0:
+            log.error('iptables-restore failed: %s', err.strip())
+            return False
+        self.sig = sig
+        return True
+
+    # Usage: self.read_counters() -> {inner ip: [upload bytes, download bytes]} of the allowed keys; None when unreadable.
+    #        Upload = what the key's proxy sent to the internet, download = what came back.
+    def read_counters(self):
+        rc, out, _ = run(['iptables-save', '-c', '-t', 'filter'])
+        if rc != 0:
+            return None
+        res = {}
+        for m in re.finditer(r'^\[\d+:(\d+)\] -A (%s|%s) -([sd]) (\d+\.\d+\.\d+\.\d+)/32\s*$' % (self.CH_OUT, self.CH_IN), out, re.M):
+            res.setdefault(m.group(4), [0, 0])[0 if m.group(2) == self.CH_OUT else 1] += int(m.group(1))
+        return res
+
+
+# ----------------------------------------------------------------------------------------------------------------------
 # the panel: state, accounting, policies
 # ----------------------------------------------------------------------------------------------------------------------
 
@@ -1466,13 +1700,14 @@ class Shadowbox(object):
 def new_record(single=True):
     return {'created': int(time.time()), 'up': 0, 'down': 0, 'raw': [0, 0],
             'last_seen': 0, 'first_connected': 0, 'paused': False, 'limit': 0, 'expires_at': 0, 'expires_after': '',
-            'single_device': single}
+            'single_device': single, 'inner': ''}
 
 
 class Panel(object):
-    # Usage: Panel(cfg, ss_server, shadowbox) -> loads state.json; call tick() every sample_seconds and the api_* methods per request
-    def __init__(self, cfg, ss, sb):
-        self.cfg, self.ss, self.sb = cfg, ss, sb
+    # Usage: Panel(cfg, ss_server, shadowbox, egress=None) -> loads state.json; call tick() every sample_seconds and the api_*
+    #        methods per request. With an Egress every key gets an inner IP and usage comes from kernel counters.
+    def __init__(self, cfg, ss, sb, eg=None):
+        self.cfg, self.ss, self.sb, self.eg = cfg, ss, sb, eg
         self.lock = threading.RLock()
         self.state = {'version': 2, 'keys': {}}
         self.dirty = False
@@ -1482,7 +1717,7 @@ class Panel(object):
         self.sb_time = 0
         self.guard_info = {}        # last answer of the guard: id -> status
         self.guard_started = None   # startedAt of the guard we last configured (a change = ss-server restarted)
-        self.guard_sent = {}        # id -> (blocked, single) last pushed
+        self.guard_sent = {}        # id -> (blocked, single, inner ip) last pushed
         self.guard_ok = False
         self.started = time.time()
         self.load()
@@ -1585,6 +1820,43 @@ class Panel(object):
                     k['expires_at'] = add_duration(k['first_connected'], k['expires_after'])
                     log.info('key %s: first connection, ends %s', kid, server_clock(k['expires_at']))
 
+    # Usage: self.alloc_inner() -> the next free inner address of the pool (round robin, never .0 / .1 / the last one)
+    def alloc_inner(self):
+        net = ipaddress.ip_network(self.cfg['egress_pool'])
+        used = {k['inner'] for k in self.state['keys'].values() if k['inner']}
+        size = net.num_addresses - 3
+        if size < 1:
+            raise ApiError(507, 'egress_pool is too small')
+        cur = self.state.get('inner_cursor', 0)
+        for i in range(size):
+            n = (cur + i) % size
+            ip = str(net.network_address + 2 + n)
+            if ip not in used:
+                self.state['inner_cursor'] = (n + 1) % size
+                return ip
+        raise ApiError(507, 'no free inner address left in %s: widen egress_pool in config.json' % net)
+
+    # Usage: self._egress_step(now) -> gives every key an inner IP, reads the kernel counters (adds the traffic to the keys) and
+    #        then writes the firewall rules for the current blocks. Reading first matters: writing the rules restarts the counters.
+    def _egress_step(self, now):
+        eg = self.eg
+        repaired = eg.ensure(now)
+        for kid, k in self.state['keys'].items():
+            if not k['inner']:
+                k['inner'] = self.alloc_inner()
+                self.dirty = True
+        counters = eg.read_counters()
+        for kid, k in self.state['keys'].items():
+            if counters is not None:
+                self._tick_key(kid, k, counters.get(k['inner'], [0, 0]), now)
+        want = {k['inner']: self.status_of(k, now) != 'active' for k in self.state['keys'].values()}
+        if sorted(want.items()) != eg.sig:
+            eg.sync_addresses(set(want))
+            if eg.apply(want):
+                for k in self.state['keys'].values():
+                    k['raw'] = [0, 0]      # the rules were rewritten: the kernel counters restart at 0
+        return repaired
+
     # Usage: self._sync_guard(now) -> reads the guard and pushes blocked / singleDevice for every key whose wanted value
     #        differs from what the guard has (or all keys after an ss-server restart, detected by a new startedAt)
     def _sync_guard(self, now):
@@ -1597,11 +1869,17 @@ class Panel(object):
         if g.get('startedAt') != self.guard_started:
             self.guard_started, self.guard_sent = g.get('startedAt'), {}
         for kid, k in self.state['keys'].items():
-            want = (self.status_of(k, now) != 'active', bool(k['single_device']))
-            have = self.guard_info.get(kid)
-            if self.guard_sent.get(kid) == want and (have is None or (have.get('blocked'), have.get('singleDevice')) == want):
+            inner = k['inner'] if self.eg else ''
+            if self.eg and not inner:
                 continue
-            if self.ss.set_guard(kid, {'blocked': want[0], 'singleDevice': want[1]}):
+            want = (self.status_of(k, now) != 'active', bool(k['single_device']), inner)
+            have = self.guard_info.get(kid)
+            if self.guard_sent.get(kid) == want and (have is None or (have.get('blocked'), have.get('singleDevice'), have.get('egress') or '') == want):
+                continue
+            payload = {'blocked': want[0], 'singleDevice': want[1]}
+            if self.eg:
+                payload['egress'] = inner
+            if self.ss.set_guard(kid, payload):
                 self.guard_sent[kid] = want
 
     # Usage: self.tick() -> one sample: counters, policies, guard. Called every sample_seconds by the background thread.
@@ -1612,12 +1890,16 @@ class Panel(object):
         except ApiError as e:
             log.debug('key list not refreshed: %s', e.message)
         with self.lock:
-            usage = self.ss.usage()
+            if self.eg:
+                self._egress_step(now)
+            else:
+                usage = self.ss.usage()
+                for kid, k in self.state['keys'].items():
+                    if usage is not None:
+                        if kid not in usage:
+                            k['raw'] = [0, 0]      # no counter at all = a fresh ss-server process (or a key without traffic yet)
+                        self._tick_key(kid, k, usage.get(kid), now)
             for kid, k in self.state['keys'].items():
-                if usage is not None:
-                    if kid not in usage:
-                        k['raw'] = [0, 0]      # no counter at all = a fresh ss-server process (or a key without traffic yet)
-                    self._tick_key(kid, k, usage.get(kid), now)
                 h = self.hist.setdefault(kid, collections.deque(maxlen=12))
                 h.append((now, k['up'], k['down']))
             self._sync_guard(now)
@@ -1653,7 +1935,7 @@ class Panel(object):
             'online': online, 'lastSeen': iso(k['last_seen']), 'lastHandshake': iso(k['last_seen']),
             'lastSeenSecondsAgo': int(now - k['last_seen']) if k['last_seen'] else None,
             'liveUploadBps': ur if online else 0, 'liveDownloadBps': dr if online else 0,
-            'singleDevice': k['single_device'], 'clientDevice': gi.get('owner') or None,
+            'singleDevice': k['single_device'], 'clientDevice': gi.get('owner') or None, 'innerIp': k['inner'] or None,
             'blockedDevices': gi.get('blockedDevices') or [], 'openConnections': gi.get('sessions', 0),
         })
         return out
@@ -1680,7 +1962,9 @@ class Panel(object):
         return {'panelVersion': VERSION, 'onlineWindowSeconds': self.cfg['online_window_seconds'],
                 'serverTime': iso(int(time.time())), 'serverClock': server_clock(time.time()),
                 'utcOffset': '%s%02d:%02d' % ('-' if off < 0 else '+', abs(off) // 60, abs(off) % 60),
-                'usageSource': 'outline-ss-server byte counters per key (saved to disk)',
+                'usageSource': ('kernel counters of the per-key inner IP on interface %s (saved to disk)' % self.cfg['egress_interface'])
+                if self.eg else 'outline-ss-server byte counters per key (saved to disk)',
+                'egressInterface': self.cfg['egress_interface'] if self.eg else None,
                 'singlePort': True, 'deviceGuard': 'active' if self.guard_ok else 'unavailable',
                 'features': ['usage', 'online', 'live-rate', 'time-limit', 'data-limit', 'pause', 'edit', 'single-device']}
 
@@ -1726,6 +2010,8 @@ class Panel(object):
                 k['expires_after'] = e[1]
                 k['expires_at'] = add_duration(k['first_connected'], e[1]) if k['first_connected'] else 0
         self.dirty = True
+        if self.eg:
+            self._egress_step(time.time())
         self._sync_guard(time.time())
         self.save()
 
@@ -1757,6 +2043,8 @@ class Panel(object):
             self.sb_keys = [k for k in self.sb_keys if str(k['id']) != str(kid)]
             self.dirty = True
             self.ss.forget_guard(str(kid))
+            if self.eg:
+                self._egress_step(time.time())
             self.save()
         return 204, None
 
@@ -1787,8 +2075,12 @@ class Panel(object):
     def api_reset(self, kid):
         k = self.record(kid)
         with self.lock:
+            if self.eg:
+                self._egress_step(time.time())     # traffic counted so far belongs to the old usage
             k['up'] = k['down'] = 0
             self.dirty = True
+            if self.eg:
+                self._egress_step(time.time())
             self._sync_guard(time.time())
             self.save()
         return self.api_get(kid)
@@ -2002,9 +2294,30 @@ def load_config(path):
     return cfg
 
 
+# Usage: net_restore(cfg) -> rebuilds the interface, the inner addresses and the firewall (blocks, counters) from state.json alone;
+#        run at boot before Docker starts, so a paused key is blocked from the first second
+def net_restore(cfg):
+    eg = Egress(cfg)
+    if not eg.ok:
+        log.error('ip / iptables are missing')
+        sys.exit(1)
+    panel = Panel(cfg, None, None, eg)
+    with panel.lock:
+        eg.ensure(time.time(), force=True)
+        now = time.time()
+        want = {k['inner']: panel.status_of(k, now) != 'active' for k in panel.state['keys'].values() if k['inner']}
+        eg.sync_addresses(set(want))
+        eg.apply(want)
+    log.info('network restored for %d keys', len(want))
+
+
 # Usage: serve(cfg) -> runs the sampling thread and the HTTPS API until SIGTERM / SIGINT
 def serve(cfg):
-    panel = Panel(cfg, SsServer(cfg), Shadowbox(cfg['shadowbox_port'], cfg['api_prefix']))
+    eg = Egress(cfg) if cfg['egress'] else None
+    if eg is not None and not eg.ok:
+        log.error('egress needs ip and iptables (iproute2, iptables); install them or set "egress": false in the config')
+        sys.exit(1)
+    panel = Panel(cfg, SsServer(cfg), Shadowbox(cfg['shadowbox_port'], cfg['api_prefix']), eg)
     stop = threading.Event()
 
     def loop():
@@ -2028,24 +2341,28 @@ def serve(cfg):
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
-    log.info('outline-panel %s on port %d (single shared key port, device guard in outline-ss-server)', VERSION, cfg['listen_port'])
+    log.info('outline-panel %s on port %d (one shared key port, device guard, egress interface %s)', VERSION, cfg['listen_port'],
+             cfg['egress_interface'] if eg else 'off')
     server.serve_forever()
     with panel.lock:
         panel.save()
 
 
-# Usage: python3 panel.py [serve|version] [--config /opt/outline/panel/config.json]
+# Usage: python3 panel.py [serve|net-restore|version] [--config /opt/outline/panel/config.json]
 def main():
     logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s')
     args = sys.argv[1:]
     path = os.environ.get('OUTLINE_PANEL_CONFIG', '/opt/outline/panel/config.json')
     if '--config' in args:
         path = args[args.index('--config') + 1]
-    cmd = next((a for a in args if a in ('serve', 'version')), 'serve')
+    cmd = next((a for a in args if a in ('serve', 'net-restore', 'version')), 'serve')
     if cmd == 'version':
         print(VERSION)
         return
-    serve(load_config(path))
+    if cmd == 'net-restore':
+        net_restore(load_config(path))
+    else:
+        serve(load_config(path))
 
 
 if __name__ == '__main__':
@@ -2063,15 +2380,33 @@ OUTLINE_PANEL_PY_END
   "shadowbox_port": ${INTERNAL_API_PORT},
   "state_file": "${PANEL_DIR}/state.json",
   "online_window_seconds": 180,
-  "single_device": true
+  "single_device": true,
+  "egress": true,
+  "egress_interface": "${EGRESS_INTERFACE}",
+  "egress_pool": "${EGRESS_POOL}"
 }
+EOF
+
+  cat > /etc/systemd/system/outline-panel-net.service <<EOF
+[Unit]
+Description=Outline panel: virtual interface, per-key counters and blocks (before Docker starts)
+Before=docker.service
+After=local-fs.target network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${PYTHON_BIN} -I ${PANEL_DIR}/panel.py net-restore --config ${PANEL_DIR}/config.json
+
+[Install]
+WantedBy=multi-user.target
 EOF
 
   cat > /etc/systemd/system/outline-panel.service <<EOF
 [Unit]
 Description=Outline panel (usage, time limits, pause, one device per key)
-After=network-online.target docker.service
-Wants=network-online.target
+After=network-online.target docker.service outline-panel-net.service
+Wants=network-online.target outline-panel-net.service
 
 [Service]
 Type=simple
@@ -2084,6 +2419,12 @@ TimeoutStopSec=20
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
+}
+
+# Usage: start_panel_net -> enables the boot unit and runs it now (interface, inner addresses, firewall rules)
+function start_panel_net() {
+  systemctl enable outline-panel-net.service >&2
+  systemctl restart outline-panel-net.service
 }
 
 # Usage: start_panel -> enables and (re)starts the key panel service
@@ -2132,6 +2473,8 @@ install_shadowbox() {
   readonly GUARD_IMAGE="${GUARD_IMAGE:-golang:1.23-alpine}"
   readonly GUARD_DIR="${GUARD_DIR:-${SHADOWBOX_DIR}/guard}"
   readonly GUARD_BIN="${GUARD_DIR}/outline-ss-server"
+  readonly EGRESS_INTERFACE="outline"
+  readonly EGRESS_POOL="${EGRESS_POOL:-10.250.0.0/16}"
 
   PUBLIC_HOSTNAME="${FLAGS_HOSTNAME:-${SB_PUBLIC_IP:-}}"
   if [[ -z "${PUBLIC_HOSTNAME}" ]]; then
@@ -2149,6 +2492,7 @@ install_shadowbox() {
 
   # Make a directory for persistent state
   run_step "Creating persistent state dir" create_persisted_state_dir
+  run_step "Checking the inner address pool" check_egress_pool
   run_step "Building the device guard (patched outline-ss-server, first run takes a few minutes)" prepare_guard
   run_step "Removing old port-per-key firewall rules (if any)" remove_v1_firewall
   run_step "Generating secret key" generate_secret_key
@@ -2156,6 +2500,7 @@ install_shadowbox() {
   run_step "Generating SHA-256 certificate fingerprint" generate_certificate_fingerprint
   run_step "Writing config" write_config
   run_step "Writing key panel files" write_panel_files
+  run_step "Creating the virtual interface and firewall rules" start_panel_net
 
   # Watchtower is not started (see the header), and one left by an earlier install is removed.
   run_step "Disabling automatic image updates" disable_watchtower
@@ -2199,6 +2544,7 @@ Key panel (usage, time limit, pause, edit, one device per key) is running as the
 - API:      GET ${PUBLIC_API_URL}/access-keys   (same URL and certificate as Outline Manager uses)
 - Key port: ${KEYS_PORT} (TCP + UDP), shared by all keys
 - Guard:    outline-ss-server ${SS_VERSION} + device guard (${GUARD_BIN})
+- Network:  interface ${EGRESS_INTERFACE}, one inner IP per key from ${EGRESS_POOL} (ip addr show ${EGRESS_INTERFACE}; iptables -L OUTLINE-OUT -nvx)
 - Logs:     journalctl -u outline-panel -f
 - Settings: vi ${PANEL_DIR}/config.json   (then: systemctl restart outline-panel)
 
