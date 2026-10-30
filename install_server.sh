@@ -14,58 +14,58 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Script to install the Outline Server docker container, a watchtower docker container
-# (to automatically update the server), the Mithra key panel, and to create a new Outline user.
+
+# Script to install the Outline Server docker container, the Mithra key panel and a patched outline-ss-server ("device
+# guard"), and to create a new Outline user.
 #
-# The stock Outline server (Shadowbox) is installed unchanged, so every key stays a normal Outline key and works in
-# the Outline Client. The key panel (a small service installed next to it) answers on the public API port, forwards
-# everything it does not handle to Shadowbox, and adds:
-#   1. traffic that is kept            (usage per key is read from kernel counters and saved on disk)
-#   2. one device per key              (the newest device wins, the older one is cut off)
+# Every key stays a normal Outline key (ss:// access URL, works in the Outline Client) and ALL keys share ONE port, just
+# like all WireGuard peers share one UDP port. What this script adds on top of the stock Outline server (Shadowbox):
+#   1. traffic that is kept            (usage per key is read from outline-ss-server's counters and saved on disk)
+#   2. one device per key              (the newest device wins, the older one is cut off at once - like WireGuard)
 #   3. online / last seen              3.1 live upload / download rate per key
 #   4. time limit per key              (date, duration from now, duration after first connection, or none)
 #   5. usage per key                   (upload, download, total, optional data limit)
 #   6. pause / resume a key            7. edit a key (name, traffic, time limit)
-# Every key has a port of its own (taken from --port-range): that is what makes 2, 3 and 6 possible, because
-# Shadowsocks has no handshake. Open the whole range (TCP and UDP) in your cloud firewall.
+# Shadowsocks has no handshake and no inner IP, so "which device is using this key" can only be decided inside the proxy,
+# where the key and the client address are known together. That is what the small patch to outline-ss-server does; this
+# script builds it on your server (in a temporary Go container) and mounts it into the Shadowbox container.
+# Watchtower is NOT started: an automatic image update would replace the patched binary's matching Shadowbox.
 #
 # You may set the following environment variables, overriding their defaults:
-# SB_IMAGE: The Outline Server Docker image to install, e.g. quay.io/outline/shadowbox:nightly
+# SB_IMAGE: The Outline Server Docker image to install, e.g. quay.io/outline/shadowbox:stable
 # CONTAINER_NAME: Docker instance name for shadowbox (default shadowbox).
 #     For multiple instances also change SHADOWBOX_DIR to an other location
 #     e.g. CONTAINER_NAME=shadowbox-inst1 SHADOWBOX_DIR=/opt/outline/inst1
 # SHADOWBOX_DIR: Directory for persistent Outline Server state.
 # ACCESS_CONFIG: The location of the access config text file.
 # SB_DEFAULT_SERVER_NAME: Default name for this server, e.g. "Outline server New York".
-#     This name will be used for the server until the admins updates the name
-#     via the REST API.
 # SENTRY_LOG_FILE: File for writing logs which may be reported to Sentry, in case
 #     of an install error. No PII should be written to this file. Intended to be set
 #     only by do_install_server.sh.
-# WATCHTOWER_REFRESH_SECONDS: refresh interval in seconds to check for updates,
-#     defaults to 3600.
 # PANEL_DIR: Directory of the key panel (default ${SHADOWBOX_DIR}/panel). Its config is PANEL_DIR/config.json
 #     (edit it with: vi ${SHADOWBOX_DIR}/panel/config.json, then: systemctl restart outline-panel).
+# GUARD_IMAGE: Docker image used once to compile the patched outline-ss-server (default golang:1.23-alpine).
+# GUARD_DIR: Where the patched binary is kept (default ${SHADOWBOX_DIR}/guard).
 #
 # Deprecated:
 # SB_PUBLIC_IP: Use the --hostname flag instead
 # SB_API_PORT: Use the --api-port flag instead
 
-# Requires curl and docker to be installed (python3, iptables, conntrack are installed by this script when missing)
+# Requires curl and docker to be installed (python3 is installed by this script when missing)
 
 set -euo pipefail
 
 # Usage: display_usage -> prints the command line flags
 function display_usage() {
   cat <<EOF
-Usage: install_server.sh [--hostname <hostname>] [--api-port <port>] [--keys-port <port>] [--port-range <first>-<last>]
+Usage: install_server.sh [--hostname <hostname>] [--api-port <port>] [--keys-port <port>]
 
   --hostname    The hostname to be used to access the management API and access keys
   --api-port    The port number for the management API
-  --keys-port   First port of the key port range (same as --port-range <port>-<port+999>)
-  --port-range  Ports for access keys, one port per key (default 20000-20999). Open it for TCP and UDP.
+  --keys-port   The ONE port all access keys use (TCP and UDP). Default: random, chosen by Outline.
 EOF
 }
+
 
 readonly SENTRY_LOG_FILE=${SENTRY_LOG_FILE:-}
 
@@ -259,6 +259,7 @@ function finish {
   rm "${LAST_ERROR}"
 }
 
+
 # Usage: get_random_port -> prints a random port between 1024 and 65535
 function get_random_port {
   local -i num=0  # Init to an invalid value, to prevent "unbound variable" errors.
@@ -268,14 +269,14 @@ function get_random_port {
   echo "${num}";
 }
 
-# Usage: get_free_random_port -> prints a random port that is neither in the key port range nor one of the ports already chosen
+# Usage: get_free_random_port -> prints a random port that is not one of the ports already chosen
 function get_free_random_port() {
   local -i port
   while true; do
     port="$(get_random_port)"
-    if (( port >= PORT_RANGE_START && port <= PORT_RANGE_END )); then continue; fi
     if (( port == ${API_PORT:-0} )); then continue; fi
     if (( port == ${INTERNAL_API_PORT:-0} )); then continue; fi
+    if (( port == ${FLAGS_KEYS_PORT:-0} )); then continue; fi
     echo "${port}"
     return 0
   done
@@ -356,7 +357,7 @@ function write_config() {
 }
 
 # Usage: start_shadowbox -> writes start_container.sh and runs it; Shadowbox's management API listens on a private port
-#        (INTERNAL_API_PORT, closed to the outside by the panel's firewall rules); the key panel owns the public API port
+#        (INTERNAL_API_PORT, only used by the key panel on this machine); the key panel owns the public API port
 function start_shadowbox() {
   # TODO(fortuna): Write API_PORT to config file,
   # rather than pass in the environment.
@@ -378,14 +379,14 @@ docker_command=(
   -d
   --name "${CONTAINER_NAME}" --restart always --net host
 
-  # Used by Watchtower to know which containers to monitor.
-  --label 'com.centurylinklabs.watchtower.enable=true'
-
   # Use log rotation. See https://docs.docker.com/config/containers/logging/configure/.
   --log-driver local
 
   # The state that is persisted across restarts.
   -v "${STATE_DIR}:${STATE_DIR}"
+
+  # The patched outline-ss-server (device guard) replaces the stock binary of the image.
+  -v "${GUARD_BIN}:${SS_BIN_IN_IMAGE}:ro"
 
   # Where the container keeps its persistent state.
   -e "SB_STATE_DIR=${STATE_DIR}"
@@ -422,27 +423,6 @@ EOF
   fi
 }
 
-# Usage: start_watchtower -> starts the Watchtower container that keeps the Shadowbox image up to date
-function start_watchtower() {
-  # Start watchtower to automatically fetch docker image updates.
-  # Set watchtower to refresh every 30 seconds if a custom SB_IMAGE is used (for
-  # testing).  Otherwise refresh every hour.
-  local -ir WATCHTOWER_REFRESH_SECONDS="${WATCHTOWER_REFRESH_SECONDS:-3600}"
-  local -ar docker_watchtower_flags=(--name watchtower --log-driver local --restart always \
-      -v /var/run/docker.sock:/var/run/docker.sock)
-  # By itself, local messes up the return code.
-  local STDERR_OUTPUT
-  STDERR_OUTPUT="$(docker run -d "${docker_watchtower_flags[@]}" containrrr/watchtower --cleanup --label-enable --tlsverify --interval "${WATCHTOWER_REFRESH_SECONDS}" 2>&1 >/dev/null)" && return
-  readonly STDERR_OUTPUT
-  log_error "FAILED"
-  if docker_container_exists watchtower; then
-    handle_docker_container_conflict watchtower false
-    return
-  else
-    log_error "${STDERR_OUTPUT}"
-    return 1
-  fi
-}
 
 # Waits for the service to be up and healthy
 # Usage: wait_shadowbox -> returns when Shadowbox answers on its private API port
@@ -466,7 +446,7 @@ function wait_panel() {
   done
 }
 
-# Usage: create_first_user -> creates the first access key (through the panel, so it gets a port of its own)
+# Usage: create_first_user -> creates the first access key (through the panel; it uses the one shared key port)
 function create_first_user() {
   fetch --insecure --request POST "${LOCAL_API_URL}/access-keys" >&2
 }
@@ -488,7 +468,7 @@ function check_firewall() {
      FIREWALL_STATUS="\
 You won’t be able to access it externally, despite your server being correctly
 set up, because there's a firewall (in this machine, your router or cloud
-provider) that is preventing incoming connections to port ${API_PORT} and to the key ports ${PORT_RANGE_START}-${PORT_RANGE_END}."
+provider) that is preventing incoming connections to port ${API_PORT} and to the key port ${KEYS_PORT}."
   else
     FIREWALL_STATUS="\
 If you have connection problems, it may be that your router or cloud provider
@@ -499,7 +479,7 @@ ${FIREWALL_STATUS}
 
 Make sure to open the following ports on your firewall, router or cloud provider:
 - Management port ${API_PORT}, for TCP
-- Access key ports ${PORT_RANGE_START}-${PORT_RANGE_END} (one port per key), for TCP and UDP
+- Access key port ${KEYS_PORT} (shared by all keys), for TCP and UDP
 "
 }
 
@@ -521,92 +501,583 @@ function set_hostname() {
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
+# Device guard (patched outline-ss-server)
+# ---------------------------------------------------------------------------------------------------------------------
+
+readonly SS_BIN_IN_IMAGE="/opt/outline-server/bin/outline-ss-server"
+
+# Usage: detect_ss_version -> sets SS_VERSION (e.g. v1.7.3): the outline-ss-server release that SB_IMAGE was built with,
+#        read from the Go build info of the binary inside the image
+function detect_ss_version() {
+  mkdir -p "${GUARD_DIR}"
+  if ! docker run --rm --entrypoint cat "${SB_IMAGE}" "${SS_BIN_IN_IMAGE}" > "${GUARD_DIR}/ss-original"; then
+    log_error "Could not read ${SS_BIN_IN_IMAGE} from ${SB_IMAGE}: this image is not a Shadowbox image this script knows."
+    return 1
+  fi
+  local info
+  info="$(docker run --rm -v "${GUARD_DIR}:/w:ro" "${GUARD_IMAGE}" go version -m /w/ss-original)" || return 1
+  SS_VERSION="$(awk '($1 == "dep" || $1 == "mod") && $2 ~ /Jigsaw-Code\/outline-ss-server$/ { print $3; exit }' <<<"${info}")"
+  rm -f "${GUARD_DIR}/ss-original"
+  if [[ ! "${SS_VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    log_error "The outline-ss-server inside ${SB_IMAGE} is not a Jigsaw-Code/outline-ss-server release (found: '${SS_VERSION}'), so the device guard patch does not fit it. Use SB_IMAGE=<an image built with outline-ss-server v1.7.x>."
+    return 1
+  fi
+}
+
+# Usage: build_guard -> compiles outline-ss-server ${SS_VERSION} with the device guard patch into ${GUARD_BIN}
+#        (skipped when the same version and patch were already built)
+function build_guard() {
+  mkdir -p "${GUARD_DIR}"
+  cat > "${GUARD_DIR}/guard.patch" <<'OUTLINE_GUARD_PATCH_END'
+diff -uN a/cmd/outline-ss-server/main.go b/cmd/outline-ss-server/main.go
+--- a/cmd/outline-ss-server/main.go	2026-10-29 19:39:16.168557849 -0700
++++ b/cmd/outline-ss-server/main.go	2026-10-29 19:44:26.535116277 -0700
+@@ -379,6 +379,8 @@
+ 
+ 	if flags.MetricsAddr != "" {
+ 		http.Handle("/metrics", promhttp.Handler())
++		http.Handle("/guard/keys", service.DefaultDeviceGuard.Handler())
++		http.Handle("/guard/keys/", service.DefaultDeviceGuard.Handler())
+ 		go func() {
+ 			slog.Error("Failed to run metrics server. Aborting.", "err", http.ListenAndServe(flags.MetricsAddr, nil))
+ 		}()
+diff -uN a/service/deviceguard.go b/service/deviceguard.go
+--- a/service/deviceguard.go	1969-12-31 16:00:00.000000000 -0800
++++ b/service/deviceguard.go	2026-10-29 19:44:26.540516278 -0700
+@@ -0,0 +1,372 @@
++// Copyright 2026 Mithra Corp.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package service
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/netip"
++	"os"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++)
++
++// DeviceGuard adds two things Shadowsocks does not have on its own:
++//
++//  1. One device per access key. A device is a client address (IPv4 address, or the /64 of an IPv6 address, so that
++//     privacy-address rotation is still one device). The newest device wins: when a key is used from a new device,
++//     every connection of the previous device is closed and that device is refused until the new device has been
++//     gone for releaseAfter. This is how WireGuard behaves when two devices share one key.
++//  2. A block switch per access key (paused / over data limit / expired), applied at once to new and open connections.
++//
++// A connection only counts as a device after it authenticated with the key's cipher, so scanners and active probes
++// can never push a real user off.
++//
++// The guard is a process-wide singleton (DefaultDeviceGuard) so that it survives configuration reloads, which
++// replace the handlers. It is controlled over HTTP (see Handler); a controller that restarts should push its
++// settings again when StartedAt changes.
++type DeviceGuard struct {
++	mu            sync.Mutex
++	keys          map[string]*keyGuard
++	startedAt     time.Time
++	defaultSingle bool
++	releaseAfter  time.Duration
++	now           func() time.Time
++	nextSession   uint64
++}
++
++type guardSession struct {
++	device string
++	kill   func()
++}
++
++type keyGuard struct {
++	blocked     bool
++	single      *bool // nil: use the guard's default
++	owner       string
++	ownerIdle   time.Time // when the owner's last session closed; zero while it has sessions
++	blockedDevs map[string]time.Time
++	sessions    map[uint64]*guardSession
++	lastSeen    time.Time
++}
++
++// DefaultDeviceGuard is the guard used by the TCP and UDP handlers.
++// Environment: OUTLINE_GUARD_SINGLE_DEVICE=0 turns one-device-per-key off by default (it can still be set per key),
++// OUTLINE_GUARD_RELEASE_SECONDS (default 60) is how long a device must be gone before a refused device may return.
++var DefaultDeviceGuard = NewDeviceGuardFromEnv()
++
++// NewDeviceGuard creates a guard. Usage: NewDeviceGuard(true, time.Minute).
++func NewDeviceGuard(defaultSingle bool, releaseAfter time.Duration) *DeviceGuard {
++	return &DeviceGuard{
++		keys:          make(map[string]*keyGuard),
++		startedAt:     time.Now(),
++		defaultSingle: defaultSingle,
++		releaseAfter:  releaseAfter,
++		now:           time.Now,
++	}
++}
++
++// NewDeviceGuardFromEnv creates a guard configured from the environment (see DefaultDeviceGuard).
++//
++// Usage: g := NewDeviceGuardFromEnv()
++func NewDeviceGuardFromEnv() *DeviceGuard {
++	single := os.Getenv("OUTLINE_GUARD_SINGLE_DEVICE") != "0"
++	release := 60 * time.Second
++	if v, err := strconv.Atoi(os.Getenv("OUTLINE_GUARD_RELEASE_SECONDS")); err == nil && v >= 0 {
++		release = time.Duration(v) * time.Second
++	}
++	return NewDeviceGuard(single, release)
++}
++
++// DeviceID turns a client address into the identity of its device: an IPv4 address as is, an IPv6 address as its /64
++// prefix, an IPv4-mapped IPv6 address as the IPv4 address. It returns "" for an invalid address.
++//
++// Usage: id := DeviceID(netip.MustParseAddr("2001:db8::1")) // "2001:db8::/64"
++func DeviceID(addr netip.Addr) string {
++	if !addr.IsValid() {
++		return ""
++	}
++	addr = addr.Unmap()
++	if addr.Is6() {
++		p, err := addr.Prefix(64)
++		if err != nil {
++			return ""
++		}
++		return p.String()
++	}
++	return addr.String()
++}
++
++// keyLocked returns the state of a key, creating it. The caller must hold g.mu.
++//
++// Usage: k := g.keyLocked("3") // with g.mu held
++func (g *DeviceGuard) keyLocked(id string) *keyGuard {
++	k := g.keys[id]
++	if k == nil {
++		k = &keyGuard{blockedDevs: map[string]time.Time{}, sessions: map[uint64]*guardSession{}}
++		g.keys[id] = k
++	}
++	return k
++}
++
++// singleLocked tells whether one-device-per-key applies to a key. The caller must hold g.mu.
++//
++// Usage: if g.singleLocked(k) { ... } // with g.mu held
++func (g *DeviceGuard) singleLocked(k *keyGuard) bool {
++	if k.single != nil {
++		return *k.single
++	}
++	return g.defaultSingle
++}
++
++// ownerSessionsLocked counts the open sessions of the key's owner. The caller must hold g.mu.
++//
++// Usage: n := k.ownerSessionsLocked() // with the guard lock held
++func (k *keyGuard) ownerSessionsLocked() int {
++	n := 0
++	for _, s := range k.sessions {
++		if s.device == k.owner {
++			n++
++		}
++	}
++	return n
++}
++
++// Register is called once a connection (TCP) or association (UDP) has authenticated with key keyID from client.
++// It returns whether the connection may go on. kill must close the connection; the guard calls it when the device is
++// pushed out or the key is blocked. The returned release function must be called when the connection ends.
++// A client whose address is not valid is let through untracked (unless the key is blocked).
++//
++// Usage: release, ok, why := g.Register(keyID, clientIP, func() { conn.Close() }); defer release()
++func (g *DeviceGuard) Register(keyID string, client netip.Addr, kill func()) (release func(), ok bool, reason string) {
++	dev := DeviceID(client)
++	var toKill []func()
++	g.mu.Lock()
++	now := g.now()
++	k := g.keyLocked(keyID)
++	k.lastSeen = now
++	if k.blocked {
++		g.mu.Unlock()
++		return func() {}, false, "key_blocked"
++	}
++	if dev == "" {
++		g.mu.Unlock()
++		return func() {}, true, ""
++	}
++	if g.singleLocked(k) {
++		// The owner has been gone long enough: the key is free again and refused devices may come back.
++		if k.owner != "" && k.ownerSessionsLocked() == 0 && !k.ownerIdle.IsZero() && now.Sub(k.ownerIdle) >= g.releaseAfter {
++			k.owner = ""
++			k.blockedDevs = map[string]time.Time{}
++		}
++		if _, refused := k.blockedDevs[dev]; refused {
++			g.mu.Unlock()
++			return func() {}, false, "device_blocked"
++		}
++		if k.owner != "" && k.owner != dev {
++			// A new device: the newest wins. The previous device is cut off and refused from now on.
++			k.blockedDevs[k.owner] = now
++			for id, s := range k.sessions {
++				if s.device != dev {
++					toKill = append(toKill, s.kill)
++					delete(k.sessions, id)
++				}
++			}
++		}
++		k.owner = dev
++		k.ownerIdle = time.Time{}
++	}
++	g.nextSession++
++	id := g.nextSession
++	k.sessions[id] = &guardSession{device: dev, kill: kill}
++	g.mu.Unlock()
++
++	for _, f := range toKill {
++		if f != nil {
++			f()
++		}
++	}
++	var once sync.Once
++	return func() {
++		once.Do(func() {
++			g.mu.Lock()
++			defer g.mu.Unlock()
++			k := g.keys[keyID]
++			if k == nil {
++				return
++			}
++			delete(k.sessions, id)
++			if k.owner != "" && k.ownerSessionsLocked() == 0 {
++				k.ownerIdle = g.now()
++			}
++		})
++	}, true, ""
++}
++
++// Allowed is the cheap per-packet check for an association that is already open (UDP): it is false when the key is
++// blocked or the device has been pushed out since the association was created.
++//
++// Usage: if !g.Allowed(keyID, clientIP) { drop the packet }
++func (g *DeviceGuard) Allowed(keyID string, client netip.Addr) bool {
++	dev := DeviceID(client)
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	k := g.keys[keyID]
++	if k == nil {
++		return true
++	}
++	if k.blocked {
++		return false
++	}
++	if dev == "" || !g.singleLocked(k) {
++		return true
++	}
++	_, refused := k.blockedDevs[dev]
++	return !refused
++}
++
++// SetBlocked blocks or unblocks a key. Blocking closes all its open connections at once.
++//
++// Usage: g.SetBlocked("3", true) // pause; false resumes
++func (g *DeviceGuard) SetBlocked(keyID string, blocked bool) {
++	var toKill []func()
++	g.mu.Lock()
++	k := g.keyLocked(keyID)
++	k.blocked = blocked
++	if blocked {
++		for id, s := range k.sessions {
++			toKill = append(toKill, s.kill)
++			delete(k.sessions, id)
++		}
++		k.ownerIdle = g.now()
++	}
++	g.mu.Unlock()
++	for _, f := range toKill {
++		if f != nil {
++			f()
++		}
++	}
++}
++
++// SetSingleDevice turns one-device-per-key on or off for a key; nil goes back to the guard's default.
++// Turning it off forgets the owner and the refused devices.
++//
++// Usage: off := false; g.SetSingleDevice("3", &off) // nil = default
++func (g *DeviceGuard) SetSingleDevice(keyID string, single *bool) {
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	k := g.keyLocked(keyID)
++	k.single = single
++	if !g.singleLocked(k) {
++		k.owner = ""
++		k.blockedDevs = map[string]time.Time{}
++	}
++}
++
++// Forget drops everything known about a key (call it when the key is deleted).
++//
++// Usage: g.Forget("3")
++func (g *DeviceGuard) Forget(keyID string) {
++	g.SetBlocked(keyID, true)
++	g.mu.Lock()
++	delete(g.keys, keyID)
++	g.mu.Unlock()
++}
++
++// KeyStatus is what the HTTP interface reports about one key.
++type KeyStatus struct {
++	Blocked        bool     `json:"blocked"`
++	SingleDevice   bool     `json:"singleDevice"`
++	Owner          string   `json:"owner"`
++	Sessions       int      `json:"sessions"`
++	BlockedDevices []string `json:"blockedDevices"`
++	LastSeen       int64    `json:"lastSeen"`
++}
++
++// Snapshot returns the state of every key the guard has seen or been told about.
++//
++// Usage: for id, st := range g.Snapshot() { ... }
++func (g *DeviceGuard) Snapshot() map[string]KeyStatus {
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	out := make(map[string]KeyStatus, len(g.keys))
++	for id, k := range g.keys {
++		devs := make([]string, 0, len(k.blockedDevs))
++		for d := range k.blockedDevs {
++			devs = append(devs, d)
++		}
++		sort.Strings(devs)
++		var seen int64
++		if !k.lastSeen.IsZero() {
++			seen = k.lastSeen.Unix()
++		}
++		out[id] = KeyStatus{Blocked: k.blocked, SingleDevice: g.singleLocked(k), Owner: k.owner,
++			Sessions: len(k.sessions), BlockedDevices: devs, LastSeen: seen}
++	}
++	return out
++}
++
++// Handler serves the control interface. Mount it on the (local) metrics address:
++//
++//	GET    /guard/keys        -> {"startedAt": unix, "defaultSingleDevice": bool, "keys": {"<id>": KeyStatus, ...}}
++//	PUT    /guard/keys/<id>   {"blocked": bool, "singleDevice": bool|null}  (either field may be left out)
++//	DELETE /guard/keys/<id>   forget the key
++func (g *DeviceGuard) Handler() http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/guard/keys"), "/")
++		w.Header().Set("Content-Type", "application/json")
++		switch {
++		case path == "" && r.Method == http.MethodGet:
++			json.NewEncoder(w).Encode(map[string]any{
++				"startedAt":           g.startedAt.Unix(),
++				"defaultSingleDevice": g.defaultSingle,
++				"keys":                g.Snapshot(),
++			})
++		case path != "" && !strings.Contains(path, "/") && r.Method == http.MethodPut:
++			var body struct {
++				Blocked      *bool           `json:"blocked"`
++				SingleDevice json.RawMessage `json:"singleDevice"`
++			}
++			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
++				http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
++				return
++			}
++			if body.SingleDevice != nil {
++				var single *bool
++				if string(body.SingleDevice) != "null" {
++					var b bool
++					if err := json.Unmarshal(body.SingleDevice, &b); err != nil {
++						http.Error(w, `{"error":"singleDevice must be true, false or null"}`, http.StatusBadRequest)
++						return
++					}
++					single = &b
++				}
++				g.SetSingleDevice(path, single)
++			}
++			if body.Blocked != nil {
++				g.SetBlocked(path, *body.Blocked)
++			}
++			w.WriteHeader(http.StatusNoContent)
++		case path != "" && !strings.Contains(path, "/") && r.Method == http.MethodDelete:
++			g.Forget(path)
++			w.WriteHeader(http.StatusNoContent)
++		default:
++			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
++		}
++	})
++}
+diff -uN a/service/tcp.go b/service/tcp.go
+--- a/service/tcp.go	2026-10-29 19:39:16.162498601 -0700
++++ b/service/tcp.go	2026-10-29 19:44:26.529820718 -0700
+@@ -345,6 +345,12 @@
+ 		h.absorbProbe(outerConn, connMetrics, authErr.Status, proxyMetrics)
+ 		return authErr
+ 	}
++	// Device guard: one device per key, and paused/limited/expired keys are cut at once.
++	releaseGuard, allowed, reason := DefaultDeviceGuard.Register(id, remoteIP(outerConn), func() { outerConn.Close() })
++	if !allowed {
++		return onet.NewConnectionError("ERR_DEVICE_GUARD", "Connection refused by device guard: "+reason, nil)
++	}
++	defer releaseGuard()
+ 	connMetrics.AddAuthenticated(id)
+ 
+ 	// Read target address and dial it.
+diff -uN a/service/udp.go b/service/udp.go
+--- a/service/udp.go	2026-10-29 19:39:16.165503995 -0700
++++ b/service/udp.go	2026-10-29 19:44:26.533021590 -0700
+@@ -188,8 +188,17 @@
+ 				if err != nil {
+ 					return onet.NewConnectionError("ERR_CREATE_SOCKET", "Failed to create UDP socket", err)
+ 				}
+-				targetConn = nm.Add(clientAddr, clientConn, cryptoKey, udpConn, keyID)
++				releaseGuard, allowed, reason := DefaultDeviceGuard.Register(keyID, ip, func() { udpConn.Close() })
++				if !allowed {
++					udpConn.Close()
++					return onet.NewConnectionError("ERR_DEVICE_GUARD", "Packet refused by device guard: "+reason, nil)
++				}
++				targetConn = nm.Add(clientAddr, clientConn, cryptoKey, udpConn, keyID, releaseGuard)
+ 			} else {
++				// Already-open association: drop packets once the key is blocked or the device was pushed out.
++				if !DefaultDeviceGuard.Allowed(targetConn.keyID, clientAddr.(*net.UDPAddr).AddrPort().Addr()) {
++					return onet.NewConnectionError("ERR_DEVICE_GUARD", "Packet refused by device guard", nil)
++				}
+ 				unpackStart := time.Now()
+ 				textData, err := shadowsocks.Unpack(nil, cipherData, targetConn.cryptoKey)
+ 				timeToCipher := time.Since(unpackStart)
+@@ -364,13 +373,16 @@
+ 	return nil
+ }
+ 
+-func (m *natmap) Add(clientAddr net.Addr, clientConn net.PacketConn, cryptoKey *shadowsocks.EncryptionKey, targetConn net.PacketConn, keyID string) *natconn {
++func (m *natmap) Add(clientAddr net.Addr, clientConn net.PacketConn, cryptoKey *shadowsocks.EncryptionKey, targetConn net.PacketConn, keyID string, release func()) *natconn {
+ 	connMetrics := m.metrics.AddUDPNatEntry(clientAddr, keyID)
+ 	entry := m.set(clientAddr.String(), targetConn, cryptoKey, keyID, connMetrics)
+ 
+ 	m.running.Add(1)
+ 	go func() {
+ 		timedCopy(clientAddr, clientConn, entry, keyID, m.logger)
++		if release != nil {
++			release()
++		}
+ 		connMetrics.RemoveNatEntry()
+ 		if pc := m.del(clientAddr.String()); pc != nil {
+ 			pc.Close()
+OUTLINE_GUARD_PATCH_END
+  local stamp
+  stamp="${SS_VERSION}-$(sha256sum "${GUARD_DIR}/guard.patch" | cut -c1-16)"
+  if [[ -x "${GUARD_BIN}" && "$(cat "${GUARD_DIR}/stamp" 2>/dev/null || true)" == "${stamp}" ]]; then
+    return 0
+  fi
+  rm -f "${GUARD_BIN}" "${GUARD_DIR}/stamp"
+  log_command docker run --rm -v "${GUARD_DIR}:/out" -e "SS_VERSION=${SS_VERSION}" -e CGO_ENABLED=0 "${GUARD_IMAGE}" sh -ec '
+    apk add --no-cache git >/dev/null
+    git clone --quiet --depth 1 --branch "${SS_VERSION}" https://github.com/Jigsaw-Code/outline-ss-server /src
+    cd /src
+    git apply --whitespace=nowarn /out/guard.patch
+    go build -ldflags="-s -w -X main.version=embedded-guard" -o /out/outline-ss-server ./cmd/outline-ss-server
+  ' >&2 || { log_error "Compiling the device guard failed (needs internet access to github.com and the Go module proxy)."; return 1; }
+  # Smoke test: the binary must run (static, no libc needed).
+  docker run --rm -v "${GUARD_DIR}:/w:ro" alpine /w/outline-ss-server -version >/dev/null || return 1
+  echo "${stamp}" > "${GUARD_DIR}/stamp"
+}
+
+# Usage: prepare_guard -> detects the ss-server version of SB_IMAGE, then builds the patched binary (GUARD_BIN)
+function prepare_guard() {
+  docker pull "${SB_IMAGE}" >&2
+  detect_ss_version
+  build_guard
+}
+
+# Usage: remove_v1_firewall -> removes the iptables chains and the boot unit of the earlier port-per-key version of the panel
+#        (nothing happens when they do not exist)
+function remove_v1_firewall() {
+  if [[ -f /etc/systemd/system/outline-panel-firewall.service ]]; then
+    systemctl disable --now outline-panel-firewall.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/outline-panel-firewall.service
+    systemctl daemon-reload
+  fi
+  local ipt chain parent
+  for ipt in iptables ip6tables; do
+    command_exists "${ipt}" || continue
+    for parent in INPUT OUTPUT; do
+      for chain in OLP-GUARD OLP-GUARD-OUT OLP-IN OLP-OUT; do
+        while "${ipt}" -w -D "${parent}" -j "${chain}" 2>/dev/null; do :; done
+      done
+    done
+    for chain in OLP-GUARD OLP-GUARD-OUT OLP-IN OLP-OUT; do
+      "${ipt}" -w -F "${chain}" 2>/dev/null && "${ipt}" -w -X "${chain}" 2>/dev/null || true
+    done
+  done
+}
+
+# Usage: disable_watchtower -> removes a Watchtower container left by an earlier install: it would update Shadowbox to an image
+#        whose outline-ss-server no longer matches the patched binary
+function disable_watchtower() {
+  if docker_container_exists watchtower; then
+    docker rm -f watchtower >/dev/null
+  fi
+}
+
+# ---------------------------------------------------------------------------------------------------------------------
 # Key panel
 # ---------------------------------------------------------------------------------------------------------------------
 
-# Usage: panel_pkg <python3|iptables|conntrack|ss> -> prints the package that provides it for this system's package manager
-function panel_pkg() {
-  case "$1:${PKG_MANAGER}" in
-    python3:pacman)      echo python ;;
-    python3:*)           echo python3 ;;
-    iptables:*)          echo iptables ;;
-    conntrack:apt-get)   echo conntrack ;;
-    conntrack:*)         echo conntrack-tools ;;
-    ss:dnf|ss:yum)       echo iproute ;;
-    ss:*)                echo iproute2 ;;
-  esac
-}
-
-# Usage: install_panel_requirements -> installs python3, iptables, conntrack and ss (iproute2) when they are missing
+# Usage: install_panel_requirements -> installs python3 when it is missing
 function install_panel_requirements() {
-  local -a missing=()
-  local tool
-  for tool in python3 iptables conntrack ss; do
-    command_exists "${tool}" || missing+=("${tool}")
-  done
-  if (( ${#missing[@]} == 0 )); then
-    return 0
-  fi
-  PKG_MANAGER=""
+  command_exists python3 && return 0
+  local pm="" tool
   for tool in apt-get dnf yum apk pacman zypper; do
-    if command_exists "${tool}"; then PKG_MANAGER="${tool}"; break; fi
+    if command_exists "${tool}"; then pm="${tool}"; break; fi
   done
-  if [[ -z "${PKG_MANAGER}" ]]; then
-    log_error "Please install these first, then run this script again: ${missing[*]}"
+  if [[ -z "${pm}" ]]; then
+    log_error "Please install python3 first, then run this script again."
     return 1
   fi
-  local -a packages=()
-  for tool in "${missing[@]}"; do
-    packages+=("$(panel_pkg "${tool}")")
-  done
-  case "${PKG_MANAGER}" in
-    apt-get) DEBIAN_FRONTEND=noninteractive apt-get update -qq >&2 && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${packages[@]}" >&2 ;;
-    dnf|yum) "${PKG_MANAGER}" install -y -q "${packages[@]}" >&2 ;;
-    apk)     apk add --quiet "${packages[@]}" >&2 ;;
-    pacman)  pacman -S --noconfirm --needed "${packages[@]}" >&2 ;;
-    zypper)  zypper --non-interactive install "${packages[@]}" >&2 ;;
+  case "${pm}" in
+    apt-get) DEBIAN_FRONTEND=noninteractive apt-get update -qq >&2 && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 >&2 ;;
+    dnf|yum) "${pm}" install -y -q python3 >&2 ;;
+    apk)     apk add --quiet python3 >&2 ;;
+    pacman)  pacman -S --noconfirm --needed python >&2 ;;
+    zypper)  zypper --non-interactive install python3 >&2 ;;
   esac
-  modprobe nf_conntrack 2>/dev/null || true
-  for tool in python3 iptables conntrack; do
-    command_exists "${tool}" || { log_error "Could not install ${tool}"; return 1; }
-  done
+  command_exists python3 || { log_error "Could not install python3"; return 1; }
 }
 
-# Usage: check_port_ranges -> stops when the key port range is invalid or overlaps the API ports; warns when it overlaps
-#        the ports Linux hands out to outgoing connections
-function check_port_ranges() {
-  if (( PORT_RANGE_START < 1024 || PORT_RANGE_END > 65535 || PORT_RANGE_START >= PORT_RANGE_END )); then
-    log_error "Invalid --port-range ${PORT_RANGE_START}-${PORT_RANGE_END}: use two ports from 1024 to 65535, first below last."
-    return 1
+# Usage: read_keys_port -> sets KEYS_PORT: the one port new access keys use (asked from Shadowbox through the panel)
+function read_keys_port() {
+  KEYS_PORT="$(fetch --insecure "${LOCAL_API_URL}/server" | grep -o '"portForNewAccessKeys": *[0-9]*' | grep -o '[0-9]*$' || true)"
+  if [[ -z "${KEYS_PORT}" ]]; then
+    KEYS_PORT="$(fetch --insecure "${LOCAL_API_URL}/access-keys" | grep -o '"port": *[0-9]*' | head -n 1 | grep -o '[0-9]*$' || true)"
   fi
-  if (( API_PORT >= PORT_RANGE_START && API_PORT <= PORT_RANGE_END )); then
-    log_error "The API port ${API_PORT} lies inside the key port range ${PORT_RANGE_START}-${PORT_RANGE_END}: choose another --api-port or --port-range."
-    return 1
-  fi
-  local eph_lo=32768 eph_hi=60999
-  if [[ -r /proc/sys/net/ipv4/ip_local_port_range ]]; then
-    read -r eph_lo eph_hi < /proc/sys/net/ipv4/ip_local_port_range || true
-  fi
-  if (( PORT_RANGE_START <= eph_hi && PORT_RANGE_END >= eph_lo )); then
-    log_error "Note: ${PORT_RANGE_START}-${PORT_RANGE_END} overlaps the ports used for outgoing connections (${eph_lo}-${eph_hi}); a key port may then be busy. A range below ${eph_lo} is safer."
-  fi
+  [[ -n "${KEYS_PORT}" ]]
 }
 
-# Usage: open_key_ports -> opens the API port and the key port range in ufw or firewalld when one of them is active
-function open_key_ports() {
+# Usage: open_ports -> opens the API port and the key port in ufw or firewalld when one of them is active
+function open_ports() {
   if command_exists ufw && ufw status 2>/dev/null | grep -q '^Status: active'; then
     ufw allow "${API_PORT}/tcp" >&2
-    ufw allow "${PORT_RANGE_START}:${PORT_RANGE_END}/tcp" >&2
-    ufw allow "${PORT_RANGE_START}:${PORT_RANGE_END}/udp" >&2
+    ufw allow "${KEYS_PORT}/tcp" >&2
+    ufw allow "${KEYS_PORT}/udp" >&2
   elif command_exists firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
     firewall-cmd --permanent --add-port="${API_PORT}/tcp" >&2
-    firewall-cmd --permanent --add-port="${PORT_RANGE_START}-${PORT_RANGE_END}/tcp" >&2
-    firewall-cmd --permanent --add-port="${PORT_RANGE_START}-${PORT_RANGE_END}/udp" >&2
+    firewall-cmd --permanent --add-port="${KEYS_PORT}/tcp" >&2
+    firewall-cmd --permanent --add-port="${KEYS_PORT}/udp" >&2
     firewall-cmd --reload >&2
   fi
 }
 
-# Usage: write_panel_files -> writes panel.py, config.json and the two systemd units
+# Usage: write_panel_files -> writes panel.py, config.json and the systemd unit
 function write_panel_files() {
   readonly PANEL_DIR="${PANEL_DIR:-${SHADOWBOX_DIR}/panel}"
   mkdir -p "${PANEL_DIR}"
@@ -619,10 +1090,15 @@ function write_panel_files() {
 #
 # outline-panel - key manager that sits in front of the stock Outline server (Shadowbox).
 #
-# What it adds on top of Shadowbox (every key stays a normal Outline key: the ss:// access URL works in the Outline Client):
-#   1. Traffic that is kept: per-key totals are read from kernel counters and saved to disk, so they survive restarts.
-#   2. One device per key: every key owns its own port; the newest device (client address) wins, the older one is cut off.
-#   3. Online / last seen: derived from the last traffic on the key's port (Shadowsocks has no handshake).
+# All keys share ONE port (like WireGuard's single UDP port) and every key stays a normal Outline key:
+# the ss:// access URL works in the Outline Client.
+#
+# What it adds on top of Shadowbox:
+#   1. Traffic that is kept: per-key totals come from the byte counters of the patched outline-ss-server and are saved to
+#      disk, so they survive restarts of the server, of Docker and of the VPS.
+#   2. One device per key: enforced inside the patched outline-ss-server ("device guard"): the newest device (client address)
+#      wins, the older one is cut off at once - the same way WireGuard drops the first device when a second one uses the key.
+#   3. Online / last seen: derived from the last traffic of the key (Shadowsocks has no handshake).
 #   3.1 Live upload / download rate per key.
 #   4. Time limit: a date, a duration from now, a duration after the first connection, or none.
 #   5. Usage per key: upload, download, total, with an optional data limit.
@@ -631,18 +1107,16 @@ function write_panel_files() {
 # The panel answers on the public API port with Outline's own URL layout (https://host:port/<secret>/access-keys ...).
 # Routes it does not know are forwarded unchanged to Shadowbox, which listens on a private port.
 #
-# Needs: python3 (3.6+), iptables (+ ip6tables), conntrack. Standard library only.
+# Needs: python3 (3.6+), the patched outline-ss-server (see install_server.sh). Standard library only.
 # Config: /opt/outline/panel/config.json (edit it with: vi /opt/outline/panel/config.json), state: state.json next to it.
 
 import calendar
 import collections
 import datetime
-import ipaddress
 import json
 import logging
 import os
 import re
-import shutil
 import signal
 import socket
 import ssl
@@ -654,7 +1128,7 @@ import http.client
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
-VERSION = '1.0.0'
+VERSION = '2.0.0'
 log = logging.getLogger('outline-panel')
 
 DEFAULTS = {
@@ -662,13 +1136,11 @@ DEFAULTS = {
     'api_prefix': '',                 # secret path prefix, as in Outline
     'cert_file': '', 'key_file': '',  # the same self-signed certificate Shadowbox uses (same certSha256)
     'shadowbox_port': 0,              # private Shadowbox API port (127.0.0.1)
+    'ss_metrics_port': 0,             # outline-ss-server metrics / guard port (127.0.0.1); 0 = find it automatically
     'state_file': '/opt/outline/panel/state.json',
-    'port_range': [20000, 20999],     # one port per key, taken from this range
-    'sample_seconds': 2.0,            # how often counters and flows are read
+    'sample_seconds': 2.0,            # how often the byte counters are read
     'online_window_seconds': 180,     # "online" = traffic within this many seconds
-    'owner_release_seconds': 60,      # an idle owner gives up its key after this long (blocked devices may return)
-    'min_reply_bytes': 800,           # a TCP flow counts as a real device only after the server sent it this much
-    'single_device': True,            # default for new keys
+    'single_device': True,            # default for new keys (the guard itself starts from OUTLINE_GUARD_SINGLE_DEVICE)
     'save_seconds': 10,
 }
 
@@ -858,235 +1330,101 @@ def expiry_from(body, now):
             return ('at', e)
     return None
 
-
-# Usage: device_id("203.0.113.5") -> "203.0.113.5"; an IPv6 address -> its /64 ("2001:db8:1:2::/64", so privacy-address
-#        rotation is one device); "::ffff:1.2.3.4" -> "1.2.3.4"; None for loopback / junk
-def device_id(addr):
-    try:
-        ip = ipaddress.ip_address(addr.split('%')[0])
-    except ValueError:
-        return None
-    if ip.is_loopback or ip.is_unspecified:
-        return None
-    if ip.version == 6:
-        if ip.ipv4_mapped:
-            return str(ip.ipv4_mapped)
-        return str(ipaddress.IPv6Network((int(ip) >> 64 << 64, 64)))
-    return str(ip)
-
-
-# Usage: parse_conntrack(line) -> {"proto","state","src","dport","reply_bytes","unreplied"} for a tcp/udp line of `conntrack -L`
-def parse_conntrack(line):
-    toks = line.split()
-    if len(toks) < 4 or toks[0] not in ('tcp', 'udp'):
-        return None
-    pairs = re.findall(r'\b(src|dst|sport|dport|packets|bytes)=(\S+)', line)
-    starts = [i for i, (k, _) in enumerate(pairs) if k == 'src']
-    if len(starts) < 2:
-        return None
-    orig, reply = {}, {}
-    for k, v in pairs[:starts[1]]:
-        orig.setdefault(k, v)
-    for k, v in pairs[starts[1]:]:
-        reply.setdefault(k, v)
-    try:
-        dport = int(orig['dport'])
-        rbytes = int(reply['bytes']) if 'bytes' in reply else None
-    except (KeyError, ValueError):
-        return None
-    return {'proto': toks[0], 'state': toks[3] if '=' not in toks[3] else '', 'src': orig.get('src', ''),
-            'dport': dport, 'reply_bytes': rbytes, 'unreplied': '[UNREPLIED]' in line}
-
-
-# Usage: flow_qualified(flow, 800) -> True when the flow is a real, authenticated device and not a scanner / probe:
-#        UDP: the server answered; TCP: established and the server sent at least min_reply_bytes back
-def flow_qualified(f, min_reply_bytes):
-    if f['proto'] == 'udp':
-        return not f['unreplied']
-    if f['state'] != 'ESTABLISHED':
-        return False
-    return True if f['reply_bytes'] is None else f['reply_bytes'] >= min_reply_bytes
-
-
 # ----------------------------------------------------------------------------------------------------------------------
-# firewall: counters (usage), guard (pause / limit / expiry / second device) - own chains, never touches other rules
+# outline-ss-server: byte counters + device guard (both on its local metrics port)
 # ----------------------------------------------------------------------------------------------------------------------
 
-class Netfilter(object):
-    # Usage: Netfilter() -> controls the chains OLP-GUARD / OLP-GUARD-OUT (blocks) and OLP-IN / OLP-OUT (byte counters)
-    #        for IPv4 and IPv6; the jumps sit at the top of INPUT and OUTPUT.
-    G_IN, G_OUT, C_IN, C_OUT = 'OLP-GUARD', 'OLP-GUARD-OUT', 'OLP-IN', 'OLP-OUT'
+class SsServer(object):
+    # Usage: SsServer(cfg) -> talks to the patched outline-ss-server on 127.0.0.1:<metrics port>
+    def __init__(self, cfg):
+        self.port = int(cfg.get('ss_metrics_port') or 0)
+        self.fixed = bool(self.port)
+        self.proc_dir = '/proc'
 
-    # Usage: Netfilter() -> finds which of iptables / ip6tables work on this machine and whether conntrack is installed
-    def __init__(self):
-        self.fams = []
-        for fam, binary in (('4', 'iptables'), ('6', 'ip6tables')):
-            if all(shutil.which(b) for b in (binary, binary + '-save', binary + '-restore')):
-                if run([binary, '-w', '-S'])[0] == 0:
-                    self.fams.append(fam)
-        self.has_conntrack = shutil.which('conntrack') is not None
-        self.conntrack_warned = False
-
-    # Usage: self._bin("4") -> "iptables"
-    def _bin(self, fam):
-        return 'iptables' if fam == '4' else 'ip6tables'
-
-    # Usage: self._ipt("4", ["-S", "INPUT"]) -> (rc, out, err)
-    def _ipt(self, fam, args):
-        return run([self._bin(fam), '-w'] + args)
-
-    # Usage: self._restore("4", "*filter\n...COMMIT\n") -> True on success (retries while another program holds the xtables lock)
-    def _restore(self, fam, text):
-        for _ in range(5):
-            rc, _, err = run([self._bin(fam) + '-restore', '--noflush'], input_text=text)
-            if rc == 0:
-                return True
-            if 'lock' not in err.lower():
-                break
-            time.sleep(0.5)
-        log.error('%s-restore failed: %s', self._bin(fam), err.strip())
-        return False
-
-    # Usage: self.setup() -> creates the four chains and puts their jumps first in INPUT / OUTPUT (re-run to repair). True if it changed anything.
-    #        Also adds one harmless counting rule on connection state: the kernel only tracks connections (conntrack) once some
-    #        rule needs it, and the one-device rule needs to see who is connected.
-    def setup(self):
-        changed = False
-        for fam in self.fams:
-            for ch in (self.G_IN, self.G_OUT, self.C_IN, self.C_OUT):
-                if self._ipt(fam, ['-L', ch, '-n'])[0] != 0:
-                    self._ipt(fam, ['-N', ch])
-                    changed = True
-            hook = ['-m', 'conntrack', '--ctstate', 'NEW']
-            if self._ipt(fam, ['-C', self.C_IN] + hook)[0] != 0:
-                self._ipt(fam, ['-A', self.C_IN] + hook)
-                changed = True
-            for parent, chains in (('INPUT', [self.G_IN, self.C_IN]), ('OUTPUT', [self.G_OUT, self.C_OUT])):
-                rules = [l.split() for l in self._ipt(fam, ['-S', parent])[1].splitlines() if l.startswith('-A ' + parent + ' ')]
-                head = [r for r in rules[:len(chains)]]
-                if head == [['-A', parent, '-j', c] for c in chains]:
-                    continue
-                for c in chains:
-                    for _ in range(10):
-                        if self._ipt(fam, ['-D', parent, '-j', c])[0] != 0:
-                            break
-                for c in reversed(chains):
-                    self._ipt(fam, ['-I', parent, '1', '-j', c])
-                changed = True
-        return changed
-
-    # Usage: self._saved("4") -> {(chain, proto, port): (packets, bytes)} for the counter rules, from iptables-save -c
-    def _saved(self, fam):
-        out = run([self._bin(fam) + '-save', '-c', '-t', 'filter'])[1]
-        res = {}
-        for line in out.splitlines():
-            m = re.match(r'^\[(\d+):(\d+)\] -A (OLP-IN|OLP-OUT) -p (tcp|udp)(?: -m (?:tcp|udp))? --(?:dport|sport) (\d+)\s*$', line)
-            if m:
-                res[(m.group(3), m.group(4), int(m.group(5)))] = (int(m.group(1)), int(m.group(2)))
-        return res
-
-    # Usage: self.sync_counters([20001, 20002]) -> makes the counting rules exist for exactly these key ports
-    #        (counters of existing rules are kept)
-    def sync_counters(self, ports):
-        ports = set(ports)
-        for fam in self.fams:
-            have = set(self._saved(fam))
-            want = set()
-            for p in ports:
-                for proto in ('tcp', 'udp'):
-                    want.add((self.C_IN, proto, p))
-                    want.add((self.C_OUT, proto, p))
-            for ch, proto, p in have - want:
-                self._ipt(fam, ['-D', ch, '-p', proto, '--dport' if ch == self.C_IN else '--sport', str(p)])
-            missing = sorted(want - have)
-            if missing:
-                text = '*filter\n' + ''.join('-A %s -p %s --%s %d\n' % (ch, proto, 'dport' if ch == self.C_IN else 'sport', p)
-                                             for ch, proto, p in missing) + 'COMMIT\n'
-                self._restore(fam, text)
-
-    # Usage: self.read_counters() -> {port: {"in4": bytes from clients, "out4": bytes to clients, "in6": ..., "out6": ...}}
-    def read_counters(self):
-        res = {}
-        for fam in self.fams:
-            for (ch, _proto, port), (_pk, nbytes) in self._saved(fam).items():
-                d = res.setdefault(port, {})
-                name = ('in' if ch == self.C_IN else 'out') + fam
-                d[name] = d.get(name, 0) + nbytes
-        return res
-
-    # Usage: self.apply_guard(8443, {20003}, {20001: {"203.0.113.9"}}) -> atomically rebuilds the guard chains:
-    #        the private Shadowbox port is closed to the outside, whole keys are cut (paused / limit / expired),
-    #        and blocked devices are cut on their key's port (TCP gets a reset, UDP is dropped).
-    def apply_guard(self, protect_port, block_ports, block_devs):
-        ok = True
-        for fam in self.fams:
-            lin, lout = [], []
-            if protect_port:
-                lin.append('-A %s ! -i lo -p tcp --dport %d -j DROP' % (self.G_IN, protect_port))
-            for p in sorted(block_ports):
-                lin.append('-A %s -p tcp --dport %d -j REJECT --reject-with tcp-reset' % (self.G_IN, p))
-                lin.append('-A %s -p udp --dport %d -j DROP' % (self.G_IN, p))
-                lout.append('-A %s -p tcp --sport %d -j DROP' % (self.G_OUT, p))
-                lout.append('-A %s -p udp --sport %d -j DROP' % (self.G_OUT, p))
-            for p in sorted(block_devs):
-                for dev in sorted(block_devs[p]):
-                    if (':' in dev) != (fam == '6'):
-                        continue
-                    lin.append('-A %s -s %s -p tcp --dport %d -j REJECT --reject-with tcp-reset' % (self.G_IN, dev, p))
-                    lin.append('-A %s -s %s -p udp --dport %d -j DROP' % (self.G_IN, dev, p))
-                    lout.append('-A %s -d %s -p tcp --sport %d -j DROP' % (self.G_OUT, dev, p))
-                    lout.append('-A %s -d %s -p udp --sport %d -j DROP' % (self.G_OUT, dev, p))
-            text = ('*filter\n:%s - [0:0]\n:%s - [0:0]\n-F %s\n-F %s\n' % (self.G_IN, self.G_OUT, self.G_IN, self.G_OUT)
-                    + '\n'.join(lin + lout) + ('\n' if lin or lout else '') + 'COMMIT\n')
-            ok = self._restore(fam, text) and ok
-        return ok
-
-    # Usage: self.read_flows({20001, 20002}) -> {port: {device: qualified}} from conntrack, or None when conntrack cannot be read
-    def read_flows(self, ports, min_reply_bytes):
-        if not self.has_conntrack or not ports:
-            return None
-        res = {p: {} for p in ports}
-        got = False
-        for fam in ('ipv4', 'ipv6'):
-            if fam == 'ipv6' and '6' not in self.fams:
-                continue
-            rc, out, _ = run(['conntrack', '-L', '-f', fam])
-            if rc != 0:
-                continue
-            got = True
-            for line in out.splitlines():
-                f = parse_conntrack(line)
-                if not f or f['dport'] not in res:
-                    continue
-                dev = device_id(f['src'])
-                if dev:
-                    q = flow_qualified(f, min_reply_bytes)
-                    res[f['dport']][dev] = res[f['dport']].get(dev, False) or q
-        if not got and not self.conntrack_warned:
-            self.conntrack_warned = True
-            log.warning('conntrack cannot be read: one-device-per-key is paused (modprobe nf_conntrack?)')
-        return res if got else None
-
-    # Usage: self.kill("203.0.113.9", 20001) -> best effort: drops tracked flows and closes server-side sockets of that device on that port
-    def kill(self, dev, port):
-        if self.has_conntrack and '/' not in dev:
-            for proto in ('tcp', 'udp'):
-                run(['conntrack', '-D', '-p', proto, '--orig-src', dev, '--orig-port-dst', str(port)])
-        if shutil.which('ss'):
-            run(['ss', '-K', '-t', 'state', 'established', '( sport = :%d and dst %s )' % (port, dev)])
-
-    # Usage: self.protect_conntrack() -> turns on per-flow byte accounting so scanners can be told from real clients
-    def protect_conntrack(self):
+    # Usage: self.find_port() -> the -metrics port of the running outline-ss-server (read from /proc/*/cmdline), or 0
+    def find_port(self):
         try:
-            with open('/proc/sys/net/netfilter/nf_conntrack_acct', 'w') as f:
-                f.write('1')
+            pids = [p for p in os.listdir(self.proc_dir) if p.isdigit()]
         except OSError:
-            pass
+            return 0
+        for pid in pids:
+            try:
+                with open('%s/%s/cmdline' % (self.proc_dir, pid), 'rb') as f:
+                    args = f.read().decode('utf-8', 'replace').split('\0')
+            except OSError:
+                continue
+            if not args or os.path.basename(args[0]) != 'outline-ss-server':
+                continue
+            for i, a in enumerate(args):
+                val = a.split('=', 1)[1] if a.startswith(('-metrics=', '--metrics=')) else (args[i + 1] if a in ('-metrics', '--metrics') and i + 1 < len(args) else '')
+                m = re.search(r':(\d+)$', val)
+                if m:
+                    return int(m.group(1))
+        return 0
 
+    # Usage: self._call("GET", "/metrics") -> (status, text); None when the server cannot be reached (the port is searched again)
+    def _call(self, method, path, body=None):
+        if not self.port and not self.fixed:
+            self.port = self.find_port()
+        if not self.port:
+            return None
+        try:
+            conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+            data = json.dumps(body).encode() if body is not None else None
+            conn.request(method, path, body=data, headers={'Content-Type': 'application/json'} if data else {})
+            r = conn.getresponse()
+            text = r.read().decode('utf-8', 'replace')
+            conn.close()
+            return r.status, text
+        except (OSError, http.client.HTTPException):
+            if not self.fixed:
+                self.port = 0
+            return None
 
-# ----------------------------------------------------------------------------------------------------------------------
-# Shadowbox client
-# ----------------------------------------------------------------------------------------------------------------------
+    # Usage: self.usage() -> {key id: [upload bytes, download bytes]} from shadowsocks_data_bytes (client<->proxy, TCP + UDP);
+    #        None when the server cannot be reached. Upload = what the client sent (dir c>p), download = what it received (c<p).
+    def usage(self):
+        res = self._call('GET', '/metrics')
+        if res is None or res[0] != 200:
+            return None
+        out = {}
+        for line in res[1].splitlines():
+            if 'data_bytes{' not in line or line.startswith('#') or 'per_location' in line:
+                continue
+            m = re.match(r'^\w*data_bytes\{([^}]*)\}\s+(\S+)', line)
+            if not m:
+                continue
+            lab = dict(re.findall(r'(\w+)="((?:[^"\\]|\\.)*)"', m.group(1)))
+            kid, d = lab.get('access_key'), lab.get('dir')
+            if not kid or d not in ('c>p', 'c<p'):
+                continue
+            try:
+                val = int(float(m.group(2)))
+            except ValueError:
+                continue
+            out.setdefault(kid, [0, 0])[0 if d == 'c>p' else 1] += val
+        return out
+
+    # Usage: self.guard() -> {"startedAt", "defaultSingleDevice", "keys": {id: {...}}} of the device guard; None if unreachable
+    #        (also None for a plain, unpatched outline-ss-server)
+    def guard(self):
+        res = self._call('GET', '/guard/keys')
+        if res is None or res[0] != 200:
+            return None
+        try:
+            return json.loads(res[1])
+        except ValueError:
+            return None
+
+    # Usage: self.set_guard("3", {"blocked": True, "singleDevice": True}) -> True when the guard accepted it
+    def set_guard(self, kid, payload):
+        res = self._call('PUT', '/guard/keys/' + kid, payload)
+        return res is not None and res[0] in (200, 204)
+
+    # Usage: self.forget_guard("3") -> drops everything the guard knows about a deleted key
+    def forget_guard(self, kid):
+        self._call('DELETE', '/guard/keys/' + kid)
+
 
 class Shadowbox(object):
     # Usage: Shadowbox(port, prefix) -> talks to the private Shadowbox API on 127.0.0.1
@@ -1121,31 +1459,31 @@ class Shadowbox(object):
 
 
 # ----------------------------------------------------------------------------------------------------------------------
-# the panel: state, accounting, policies, one-device rule
+# the panel: state, accounting, policies
 # ----------------------------------------------------------------------------------------------------------------------
 
-# Usage: new_record(20001, True) -> the stored state of one key
-def new_record(port, managed, single=True):
-    return {'port': port, 'managed': managed, 'created': int(time.time()), 'up': 0, 'down': 0, 'raw': {},
+# Usage: new_record(True) -> the stored state of one key
+def new_record(single=True):
+    return {'created': int(time.time()), 'up': 0, 'down': 0, 'raw': [0, 0],
             'last_seen': 0, 'first_connected': 0, 'paused': False, 'limit': 0, 'expires_at': 0, 'expires_after': '',
-            'single_device': single, 'owner': '', 'owner_active': 0, 'blocked': {}, 'first_seen': {}}
+            'single_device': single}
 
 
 class Panel(object):
-    # Usage: Panel(cfg, netfilter, shadowbox) -> loads state.json; call tick() every sample_seconds and the api_* methods per request
-    def __init__(self, cfg, nf, sb):
-        self.cfg, self.nf, self.sb = cfg, nf, sb
+    # Usage: Panel(cfg, ss_server, shadowbox) -> loads state.json; call tick() every sample_seconds and the api_* methods per request
+    def __init__(self, cfg, ss, sb):
+        self.cfg, self.ss, self.sb = cfg, ss, sb
         self.lock = threading.RLock()
-        self.state = {'version': 1, 'keys': {}, 'cursor': 0}
+        self.state = {'version': 2, 'keys': {}}
         self.dirty = False
         self.last_save = 0
         self.hist = {}
         self.sb_keys = []
         self.sb_time = 0
-        self.synced_ports = None
-        self.guard_sig = None
-        self.last_repair = 0
-        self.kill_list = []
+        self.guard_info = {}        # last answer of the guard: id -> status
+        self.guard_started = None   # startedAt of the guard we last configured (a change = ss-server restarted)
+        self.guard_sent = {}        # id -> (blocked, single) last pushed
+        self.guard_ok = False
         self.started = time.time()
         self.load()
 
@@ -1158,8 +1496,10 @@ class Panel(object):
             if isinstance(st.get('keys'), dict):
                 self.state = st
                 for k in st['keys'].values():
-                    for name, val in new_record(0, True).items():
+                    for name, val in new_record().items():
                         k.setdefault(name, val)
+                    if not isinstance(k.get('raw'), list):
+                        k['raw'] = [0, 0]      # a v1 state file (port-per-key counters): totals are kept, raw baseline restarts
         except FileNotFoundError:
             pass
         except (OSError, ValueError):
@@ -1202,18 +1542,13 @@ class Panel(object):
         keys = self.sb.keys()
         with self.lock:
             self.sb_keys, self.sb_time = keys, time.time()
-            count = collections.Counter(k['port'] for k in keys)
             ids = set()
             for k in keys:
-                ids.add(str(k['id']))
-                rec = self.state['keys'].get(str(k['id']))
-                shared = count[k['port']] > 1
-                if rec is None:
-                    rec = self.state['keys'][str(k['id'])] = new_record(k['port'], not shared, self.cfg['single_device'])
-                    log.info('adopted key %s on port %s (%s)', k['id'], k['port'], 'managed' if not shared else 'shared port')
-                    self.dirty = True
-                if rec['port'] != k['port'] or rec['managed'] == shared:
-                    rec['port'], rec['managed'] = k['port'], not shared
+                kid = str(k['id'])
+                ids.add(kid)
+                if kid not in self.state['keys']:
+                    self.state['keys'][kid] = new_record(self.cfg['single_device'])
+                    log.info('adopted key %s', kid)
                     self.dirty = True
             for kid in list(self.state['keys']):
                 rec = self.state['keys'][kid]
@@ -1225,114 +1560,51 @@ class Panel(object):
                 if rec['gone'] >= 3:
                     del self.state['keys'][kid]
                     self.hist.pop(kid, None)
+                    self.guard_sent.pop(kid, None)
+                    self.ss.forget_guard(kid)
                     self.dirty = True
 
-    # Usage: self.alloc_port(extra_used=set()) -> the next free port of the range (round robin, so a port is not reused at once)
-    def alloc_port(self, extra_used=()):
-        lo, hi = self.cfg['port_range']
-        used = set(extra_used) | {k['port'] for k in self.state['keys'].values()} | {k['port'] for k in self.sb_keys}
-        size = hi - lo + 1
-        for i in range(size):
-            port = lo + (self.state.get('cursor', 0) + i) % size
-            if port in used:
-                continue
-            ok = True
-            for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
-                s = socket.socket(socket.AF_INET, kind)
-                try:
-                    s.bind(('0.0.0.0', port))
-                except OSError:
-                    ok = False
-                finally:
-                    s.close()
-            if ok:
-                self.state['cursor'] = (port - lo + 1) % size
-                return port
-        raise ApiError(507, 'no free port left in %d-%d: widen port_range in config.json' % (lo, hi))
-
-    # Usage: self._update_devices(k, flows, now) -> one-device rule. Devices with real traffic on the key's port are compared:
-    #        the newest wins, every other device is blocked on that port (and listed in k["blocked"]) until the winner is idle
-    #        for owner_release_seconds. Returns True when the blocked list or the owner changed.
-    def _update_devices(self, k, flows, now):
-        cur = {d for d, q in (flows or {}).items() if q and d not in k['blocked']}
-        seen = k['first_seen']
-        for d in cur:
-            seen.setdefault(d, now)
-        for d in list(seen):
-            if d not in cur:
-                del seen[d]
-        changed = False
-        owner = k['owner']
-        idle = now - k['owner_active'] > self.cfg['owner_release_seconds']
-        if owner and idle and not cur:
-            # the owner left and nobody else is here: the key is free again
-            k['owner'], k['blocked'] = '', {}
-            return True
-        if owner and idle and k['blocked']:
-            # the owner is quiet: devices that were pushed out may come back (the first one back becomes the owner)
-            k['blocked'] = {}
-            changed = True
-        if cur:
-            winner = max(sorted(cur), key=lambda d: (seen[d], d == owner))
-            losers = set(cur) - {winner}
-            if owner and owner != winner:
-                losers.add(owner)
-            for d in losers:
-                if d not in k['blocked']:
-                    k['blocked'][d] = int(now)
-                    self.kill_list.append((d, k['port']))
-                    changed = True
-                    log.info('port %s: device %s replaced by %s', k['port'], d, winner)
-            if owner != winner:
-                k['owner'], k['owner_active'] = winner, now
-                changed = True
-            k['blocked'].pop(winner, None)
-            while len(k['blocked']) > 50:
-                k['blocked'].pop(min(k['blocked'], key=k['blocked'].get))
-        return changed
-
-    # Usage: self._tick_key(id, rec, counters, flows, now) -> adds the traffic since the last sample, updates last seen /
-    #        first connection / expiry start and the one-device rule of one key
-    def _tick_key(self, kid, k, counters, flows, now):
+    # Usage: self._tick_key(id, rec, [up, down] or None, now) -> adds the traffic since the last sample (a counter that went
+    #        down = ss-server restarted: the new value is all new traffic) and updates last seen / first connection / expiry start
+    def _tick_key(self, kid, k, counter, now):
         traffic = 0
-        if counters is not None:
-            for name in ('in4', 'in6', 'out4', 'out6'):
-                cur, last = counters.get(name, 0), k['raw'].get(name, 0)
+        if counter is not None:
+            for i, name in enumerate(('up', 'down')):
+                cur, last = counter[i], k['raw'][i]
                 delta = cur - last if cur >= last else cur
-                k['raw'][name] = cur
+                k['raw'][i] = cur
                 if delta:
-                    k['up' if name.startswith('in') else 'down'] += delta
+                    k[name] += delta
                     traffic += delta
-        real = flows is None or any(q for d, q in flows.items() if d not in k['blocked'])
-        if traffic and real:
-            k['last_seen'], k['owner_active'] = int(now), now
+        if traffic:
+            k['last_seen'] = int(now)
+            self.dirty = True
             if not k['first_connected']:
                 k['first_connected'] = int(now)
                 if k['expires_after'] and not k['expires_at']:
                     k['expires_at'] = add_duration(k['first_connected'], k['expires_after'])
                     log.info('key %s: first connection, ends %s', kid, server_clock(k['expires_at']))
-        if traffic:
-            self.dirty = True
-        if k['single_device'] and flows is not None and self._update_devices(k, flows, now):
-            self.dirty = True
-            self.guard_sig = None
 
-    # Usage: self._apply_guard() -> pushes the current blocks to the firewall when they changed
-    def _apply_guard(self, now):
-        block_ports, block_devs = set(), {}
-        for k in self.state['keys'].values():
-            if not k['managed']:
+    # Usage: self._sync_guard(now) -> reads the guard and pushes blocked / singleDevice for every key whose wanted value
+    #        differs from what the guard has (or all keys after an ss-server restart, detected by a new startedAt)
+    def _sync_guard(self, now):
+        g = self.ss.guard()
+        self.guard_ok = g is not None
+        if g is None:
+            self.guard_info = {}
+            return
+        self.guard_info = g.get('keys') or {}
+        if g.get('startedAt') != self.guard_started:
+            self.guard_started, self.guard_sent = g.get('startedAt'), {}
+        for kid, k in self.state['keys'].items():
+            want = (self.status_of(k, now) != 'active', bool(k['single_device']))
+            have = self.guard_info.get(kid)
+            if self.guard_sent.get(kid) == want and (have is None or (have.get('blocked'), have.get('singleDevice')) == want):
                 continue
-            if self.status_of(k, now) != 'active':
-                block_ports.add(k['port'])
-            elif k['single_device'] and k['blocked']:
-                block_devs[k['port']] = set(k['blocked'])
-        sig = (sorted(block_ports), sorted((p, sorted(d)) for p, d in block_devs.items()))
-        if sig != self.guard_sig:
-            if self.nf.apply_guard(self.cfg['shadowbox_port'], block_ports, block_devs):
-                self.guard_sig = sig
+            if self.ss.set_guard(kid, {'blocked': want[0], 'singleDevice': want[1]}):
+                self.guard_sent[kid] = want
 
-    # Usage: self.tick() -> one sample: counters, flows, policies, firewall. Called every sample_seconds by the background thread.
+    # Usage: self.tick() -> one sample: counters, policies, guard. Called every sample_seconds by the background thread.
     def tick(self):
         now = time.time()
         try:
@@ -1340,25 +1612,15 @@ class Panel(object):
         except ApiError as e:
             log.debug('key list not refreshed: %s', e.message)
         with self.lock:
-            managed = {i: k for i, k in self.state['keys'].items() if k['managed']}
-            ports = sorted({k['port'] for k in managed.values()})
-            if now - self.last_repair > 30:
-                self.last_repair = now
-                if self.nf.setup():
-                    self.synced_ports, self.guard_sig = None, None
-            if self.synced_ports != ports:
-                self.nf.sync_counters(ports)
-                self.synced_ports = ports
-            counters = self.nf.read_counters()
-            flows = self.nf.read_flows(set(ports), self.cfg['min_reply_bytes'])
-            self.kill_list = []
-            for kid, k in managed.items():
-                self._tick_key(kid, k, counters.get(k['port'], {}), None if flows is None else flows.get(k['port'], {}), now)
+            usage = self.ss.usage()
+            for kid, k in self.state['keys'].items():
+                if usage is not None:
+                    if kid not in usage:
+                        k['raw'] = [0, 0]      # no counter at all = a fresh ss-server process (or a key without traffic yet)
+                    self._tick_key(kid, k, usage.get(kid), now)
                 h = self.hist.setdefault(kid, collections.deque(maxlen=12))
                 h.append((now, k['up'], k['down']))
-            self._apply_guard(now)
-            for dev, port in self.kill_list:
-                self.nf.kill(dev, port)
+            self._sync_guard(now)
             if self.dirty and now - self.last_save >= self.cfg['save_seconds']:
                 self.save()
 
@@ -1370,20 +1632,19 @@ class Panel(object):
         dt = h[-1][0] - h[0][0]
         return (max(0, int((h[-1][1] - h[0][1]) / dt)), max(0, int((h[-1][2] - h[0][2]) / dt))) if dt > 0 else (0, 0)
 
-    # Usage: self.view(sb_key, transfer, now) -> one key as returned by the API (Outline fields + panel fields)
-    def view(self, sk, transfer, now):
+    # Usage: self.view(sb_key, now) -> one key as returned by the API (Outline fields + panel fields)
+    def view(self, sk, now):
         kid = str(sk['id'])
-        k = self.state['keys'].get(kid) or new_record(sk['port'], False)
+        k = self.state['keys'].get(kid) or new_record()
         out = dict(sk)
-        status = self.status_of(k, now) if k['managed'] else 'unmanaged'
-        up, down = (k['up'], k['down']) if k['managed'] else (None, None)
-        total = k['up'] + k['down'] if k['managed'] else transfer.get(kid, 0)
-        ur, dr = self.rate(kid, now) if k['managed'] else (0, 0)
+        status = self.status_of(k, now)
+        ur, dr = self.rate(kid, now)
         online = bool(k['last_seen'] and now - k['last_seen'] <= self.cfg['online_window_seconds'])
+        gi = self.guard_info.get(kid) or {}
         out.update({
-            'managed': k['managed'], 'status': status, 'paused': k['paused'], 'blocked': status in ('paused', 'limit', 'expired'),
+            'managed': True, 'status': status, 'paused': k['paused'], 'blocked': status in ('paused', 'limit', 'expired'),
             'createdAt': iso(k['created']),
-            'uploadBytes': up, 'downloadBytes': down, 'totalBytes': total,
+            'uploadBytes': k['up'], 'downloadBytes': k['down'], 'totalBytes': k['up'] + k['down'],
             'dataLimitBytes': k['limit'], 'dataLimit': {'bytes': k['limit']} if k['limit'] else None,
             'limitReached': status == 'limit',
             'expiresAt': iso(k['expires_at']), 'expiresAtServer': server_clock(k['expires_at']) if k['expires_at'] else None,
@@ -1392,27 +1653,17 @@ class Panel(object):
             'online': online, 'lastSeen': iso(k['last_seen']), 'lastHandshake': iso(k['last_seen']),
             'lastSeenSecondsAgo': int(now - k['last_seen']) if k['last_seen'] else None,
             'liveUploadBps': ur if online else 0, 'liveDownloadBps': dr if online else 0,
-            'singleDevice': k['single_device'], 'clientDevice': k['owner'] or None,
-            'blockedDevices': sorted(k['blocked']),
+            'singleDevice': k['single_device'], 'clientDevice': gi.get('owner') or None,
+            'blockedDevices': gi.get('blockedDevices') or [], 'openConnections': gi.get('sessions', 0),
         })
         return out
-
-    # Usage: self.transfer() -> {id: bytes} - Shadowbox's own totals, used only for keys that share a port (not managed)
-    def transfer(self):
-        if not any(not k['managed'] for k in self.state['keys'].values()):
-            return {}
-        try:
-            return {str(i): b for i, b in (self.sb.json('GET', '/metrics/transfer') or {}).get('bytesTransferredByUserId', {}).items()}
-        except ApiError:
-            return {}
 
     # Usage: self.all_views(force=True) -> (list of key views, totals dict); force=False reuses the key list read within 30 s
     def all_views(self, force=True):
         self.refresh_keys(force=force)
         now = time.time()
         with self.lock:
-            tr = self.transfer()
-            views = [self.view(sk, tr, now) for sk in self.sb_keys]
+            views = [self.view(sk, now) for sk in self.sb_keys]
         t = {'uploadBytes': 0, 'downloadBytes': 0, 'totalBytes': 0, 'liveUploadBps': 0, 'liveDownloadBps': 0, 'online': 0}
         for v in views:
             t['uploadBytes'] += v['uploadBytes'] or 0
@@ -1426,22 +1677,19 @@ class Panel(object):
     # Usage: self.server_info() -> panel facts added to /server and to every list answer
     def server_info(self):
         off = -(time.altzone if time.localtime().tm_isdst > 0 else time.timezone) // 60
-        return {'panelVersion': VERSION, 'portRange': self.cfg['port_range'], 'onlineWindowSeconds': self.cfg['online_window_seconds'],
+        return {'panelVersion': VERSION, 'onlineWindowSeconds': self.cfg['online_window_seconds'],
                 'serverTime': iso(int(time.time())), 'serverClock': server_clock(time.time()),
                 'utcOffset': '%s%02d:%02d' % ('-' if off < 0 else '+', abs(off) // 60, abs(off) % 60),
-                'usageSource': 'kernel byte counters per key port (saved to disk)',
-                'deviceDetection': 'conntrack' if self.nf.has_conntrack else 'unavailable',
+                'usageSource': 'outline-ss-server byte counters per key (saved to disk)',
+                'singlePort': True, 'deviceGuard': 'active' if self.guard_ok else 'unavailable',
                 'features': ['usage', 'online', 'live-rate', 'time-limit', 'data-limit', 'pause', 'edit', 'single-device']}
 
-    # Usage: self.record(kid) -> the stored state of a managed key; ApiError 404 unknown / 409 when it shares a port
-    def record(self, kid, need_managed=True):
+    # Usage: self.record(kid) -> the stored state of a key; ApiError 404 when unknown
+    def record(self, kid):
         self.refresh_keys(force=True)
         k = self.state['keys'].get(str(kid))
         if k is None:
             raise ApiError(404, 'no such key')
-        if need_managed and not k['managed']:
-            raise ApiError(409, 'this key shares its port with other keys, so it cannot be limited or paused: '
-                                'POST /access-keys/%s/migrate-port gives it a port of its own (its access URL changes)' % kid)
         return k
 
     # Usage: self.parse_policy(body) -> validated changes from a request body: traffic, expiry, paused, singleDevice
@@ -1460,7 +1708,7 @@ class Panel(object):
                 ch[name] = body[field]
         return ch
 
-    # Usage: self.apply_policy(rec, changes) -> stores validated changes and makes the firewall follow
+    # Usage: self.apply_policy(rec, changes) -> stores validated changes and pushes them to the guard at once
     def apply_policy(self, k, ch):
         if 'limit' in ch:
             k['limit'] = ch['limit']
@@ -1468,8 +1716,6 @@ class Panel(object):
             k['paused'] = ch['paused']
         if 'single_device' in ch:
             k['single_device'] = ch['single_device']
-            if not ch['single_device']:
-                k['owner'], k['blocked'], k['first_seen'] = '', {}, {}
         if 'expiry' in ch:
             e = ch['expiry']
             if e[0] == 'none':
@@ -1479,59 +1725,45 @@ class Panel(object):
             else:
                 k['expires_after'] = e[1]
                 k['expires_at'] = add_duration(k['first_connected'], e[1]) if k['first_connected'] else 0
-        self.dirty, self.guard_sig = True, None
-        self._apply_guard(time.time())
+        self.dirty = True
+        self._sync_guard(time.time())
         self.save()
 
-    # Usage: self.api_create({"name": "Sima", "traffic": "20G", "expires": "30d"}) -> (201, key view) - a new key on its own port
+    # Usage: self.api_create({"name": "Sima", "traffic": "20G", "expires": "30d"}) -> (201, key view) - a new key on the shared port
     def api_create(self, body):
         ch = self.parse_policy(body)
         sbody = {k: body[k] for k in ('name', 'method', 'password') if k in body}
-        self.refresh_keys(force=True)
-        tried = set()
-        for _ in range(6):
-            with self.lock:
-                port = self.alloc_port(tried)
-            sbody['port'] = port
-            st, _, data = self.sb.request('POST', '/access-keys', sbody)
-            if st in (200, 201):
-                break
-            if st == 409:
-                tried.add(port)
-                continue
+        st, _, data = self.sb.request('POST', '/access-keys', sbody)
+        if st not in (200, 201):
             raise ApiError(st, data.decode('utf-8', 'replace')[:300])
-        else:
-            raise ApiError(409, 'could not find a usable port')
         sk = json.loads(data.decode())
         with self.lock:
-            rec = self.state['keys'][str(sk['id'])] = new_record(sk['port'], True, self.cfg['single_device'])
+            rec = self.state['keys'][str(sk['id'])] = new_record(self.cfg['single_device'])
             self.sb_keys = [k for k in self.sb_keys if k['id'] != sk['id']] + [sk]
             self.apply_policy(rec, ch)
-            ports = sorted({k['port'] for k in self.state['keys'].values() if k['managed']})
-            self.nf.sync_counters(ports)
-            self.synced_ports = ports
-            view = self.view(sk, {}, time.time())
+            view = self.view(sk, time.time())
         return 201, view
 
-    # Usage: self.api_delete("3") -> (204, None) - removes the key from Shadowbox, the firewall and the state
+    # Usage: self.api_delete("3") -> (204, None) - removes the key from Shadowbox, the guard and the state
     def api_delete(self, kid):
-        self.record(kid, need_managed=False)
+        self.record(kid)
         st, _, data = self.sb.request('DELETE', '/access-keys/' + str(kid))
         if st >= 300 and st != 404:
             raise ApiError(st, data.decode('utf-8', 'replace')[:300])
         with self.lock:
             self.state['keys'].pop(str(kid), None)
             self.hist.pop(str(kid), None)
+            self.guard_sent.pop(str(kid), None)
             self.sb_keys = [k for k in self.sb_keys if str(k['id']) != str(kid)]
-            self.synced_ports, self.guard_sig, self.dirty = None, None, True
-            self._apply_guard(time.time())
+            self.dirty = True
+            self.ss.forget_guard(str(kid))
             self.save()
         return 204, None
 
     # Usage: self.api_edit("3", {"name": "Sima", "traffic": "30G", "expires": "30d"}) -> (200, key view).
     #        Edits any of: name, traffic / limit, expires / expiresOn / expiresAfterFirstConnection, paused, singleDevice.
     def api_edit(self, kid, body):
-        k = self.record(kid, need_managed=any(f != 'name' for f in body))
+        k = self.record(kid)
         ch = self.parse_policy(body)
         if 'name' in body:
             if not isinstance(body['name'], str):
@@ -1556,31 +1788,8 @@ class Panel(object):
         k = self.record(kid)
         with self.lock:
             k['up'] = k['down'] = 0
-            self.dirty, self.guard_sig = True, None
-            self._apply_guard(time.time())
-            self.save()
-        return self.api_get(kid)
-
-    # Usage: self.api_migrate("3", {"port": 20010}) -> (200, key view) - gives a shared-port key a port of its own
-    #        (same id, name and password; only the port in its access URL changes)
-    def api_migrate(self, kid, body):
-        k = self.record(kid, need_managed=False)
-        old = next((s for s in self.sb_keys if str(s['id']) == str(kid)), None)
-        if old is None:
-            raise ApiError(404, 'no such key')
-        with self.lock:
-            port = int(body.get('port') or self.alloc_port())
-        spec = {'name': old.get('name', ''), 'method': old.get('method'), 'password': old.get('password'), 'port': port}
-        self.sb.json('DELETE', '/access-keys/' + str(kid))
-        try:
-            self.sb.json('PUT', '/access-keys/' + str(kid), spec)
-        except ApiError:
-            spec['port'] = old['port']
-            self.sb.json('PUT', '/access-keys/' + str(kid), spec)
-            raise ApiError(502, 'Shadowbox refused the new port; the key was restored unchanged')
-        with self.lock:
-            k['port'], k['managed'] = port, True
-            self.synced_ports, self.guard_sig, self.dirty = None, None, True
+            self.dirty = True
+            self._sync_guard(time.time())
             self.save()
         return self.api_get(kid)
 
@@ -1679,9 +1888,6 @@ class Handler(BaseHTTPRequestHandler):
             r = m('/' + KEY + '/' + ID + '/reset-usage')
             if r:
                 return p.api_reset(r.group(1))
-            r = m('/' + KEY + '/' + ID + '/migrate-port')
-            if r:
-                return p.api_migrate(r.group(1), body or {})
             return None
         r = m('/' + KEY + '/' + ID)
         if method == 'DELETE' and r:
@@ -1731,7 +1937,7 @@ class Handler(BaseHTTPRequestHandler):
             raw, body = self.read_body()
             if body is None:
                 # not JSON: ours to refuse when it is a panel write route, otherwise Shadowbox decides
-                if re.match(r'^/' + KEY + r'(/[^/]+(/(limit|data-limit|expiry|paused|pause|resume|reset-usage|migrate-port))?)?/?$', path):
+                if re.match(r'^/' + KEY + r'(/[^/]+(/(limit|data-limit|expiry|paused|pause|resume|reset-usage))?)?/?$', path):
                     raise ApiError(400, 'body is not valid JSON')
                 res = None
             else:
@@ -1783,6 +1989,7 @@ class PanelServer(ThreadingMixIn, HTTPServer):
         log.debug('connection error from %s: %s', client_address[0], sys.exc_info()[1])
 
 
+
 # ----------------------------------------------------------------------------------------------------------------------
 # entry points
 # ----------------------------------------------------------------------------------------------------------------------
@@ -1795,27 +2002,9 @@ def load_config(path):
     return cfg
 
 
-# Usage: firewall_restore(cfg) -> rebuilds counters and blocks from state.json alone (runs before Docker starts at boot)
-def firewall_restore(cfg):
-    nf = Netfilter()
-    panel = Panel(cfg, nf, None)
-    nf.setup()
-    nf.protect_conntrack()
-    nf.sync_counters(sorted({k['port'] for k in panel.state['keys'].values() if k['managed']}))
-    panel.guard_sig = None
-    panel._apply_guard(time.time())
-    log.info('firewall restored for %d keys', len(panel.state['keys']))
-
-
 # Usage: serve(cfg) -> runs the sampling thread and the HTTPS API until SIGTERM / SIGINT
 def serve(cfg):
-    nf = Netfilter()
-    if not nf.fams:
-        log.error('iptables is not usable: install iptables and run as root')
-        sys.exit(1)
-    nf.setup()
-    nf.protect_conntrack()
-    panel = Panel(cfg, nf, Shadowbox(cfg['shadowbox_port'], cfg['api_prefix']))
+    panel = Panel(cfg, SsServer(cfg), Shadowbox(cfg['shadowbox_port'], cfg['api_prefix']))
     stop = threading.Event()
 
     def loop():
@@ -1839,29 +2028,24 @@ def serve(cfg):
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
-    log.info('outline-panel %s on port %d, key ports %d-%d, conntrack: %s', VERSION, cfg['listen_port'],
-             cfg['port_range'][0], cfg['port_range'][1], nf.has_conntrack)
+    log.info('outline-panel %s on port %d (single shared key port, device guard in outline-ss-server)', VERSION, cfg['listen_port'])
     server.serve_forever()
     with panel.lock:
         panel.save()
 
 
-# Usage: python3 panel.py [serve|firewall-restore|version] [--config /opt/outline/panel/config.json]
+# Usage: python3 panel.py [serve|version] [--config /opt/outline/panel/config.json]
 def main():
     logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s')
     args = sys.argv[1:]
     path = os.environ.get('OUTLINE_PANEL_CONFIG', '/opt/outline/panel/config.json')
     if '--config' in args:
         path = args[args.index('--config') + 1]
-    cmd = next((a for a in args if a in ('serve', 'firewall-restore', 'version')), 'serve')
+    cmd = next((a for a in args if a in ('serve', 'version')), 'serve')
     if cmd == 'version':
         print(VERSION)
         return
-    cfg = load_config(path)
-    if cmd == 'firewall-restore':
-        firewall_restore(cfg)
-    else:
-        serve(cfg)
+    serve(load_config(path))
 
 
 if __name__ == '__main__':
@@ -1878,33 +2062,16 @@ OUTLINE_PANEL_PY_END
   "key_file": "${SB_PRIVATE_KEY_FILE}",
   "shadowbox_port": ${INTERNAL_API_PORT},
   "state_file": "${PANEL_DIR}/state.json",
-  "port_range": [${PORT_RANGE_START}, ${PORT_RANGE_END}],
   "online_window_seconds": 180,
-  "owner_release_seconds": 60,
   "single_device": true
 }
-EOF
-
-  cat > /etc/systemd/system/outline-panel-firewall.service <<EOF
-[Unit]
-Description=Outline panel: restore key blocks and counters before Docker starts
-Before=docker.service
-After=local-fs.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=${PYTHON_BIN} -I ${PANEL_DIR}/panel.py firewall-restore --config ${PANEL_DIR}/config.json
-
-[Install]
-WantedBy=multi-user.target
 EOF
 
   cat > /etc/systemd/system/outline-panel.service <<EOF
 [Unit]
 Description=Outline panel (usage, time limits, pause, one device per key)
-After=network-online.target docker.service outline-panel-firewall.service
-Wants=network-online.target outline-panel-firewall.service
+After=network-online.target docker.service
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -1916,13 +2083,7 @@ TimeoutStopSec=20
 [Install]
 WantedBy=multi-user.target
 EOF
-}
-
-# Usage: start_panel_firewall -> installs the firewall unit and runs it, so a paused / limited key stays blocked from the first second
-function start_panel_firewall() {
   systemctl daemon-reload
-  systemctl enable outline-panel-firewall.service >&2
-  systemctl restart outline-panel-firewall.service
 }
 
 # Usage: start_panel -> enables and (re)starts the key panel service
@@ -1958,19 +2119,6 @@ install_shadowbox() {
   mkdir -p "${SHADOWBOX_DIR}"
   chmod u+s,ug+rwx,o-rwx "${SHADOWBOX_DIR}"
 
-  log_for_sentry "Setting key port range"
-  if [[ -n "${FLAGS_PORT_RANGE}" ]]; then
-    PORT_RANGE_START="${FLAGS_PORT_RANGE%-*}"
-    PORT_RANGE_END="${FLAGS_PORT_RANGE#*-}"
-  elif (( FLAGS_KEYS_PORT != 0 )); then
-    PORT_RANGE_START="${FLAGS_KEYS_PORT}"
-    PORT_RANGE_END=$(( FLAGS_KEYS_PORT + 999 > 65535 ? 65535 : FLAGS_KEYS_PORT + 999 ))
-  else
-    PORT_RANGE_START=20000
-    PORT_RANGE_END=20999
-  fi
-  readonly PORT_RANGE_START PORT_RANGE_END
-
   log_for_sentry "Setting API port"
   API_PORT="${FLAGS_API_PORT}"
   if (( API_PORT == 0 )); then
@@ -1979,9 +2127,11 @@ install_shadowbox() {
   readonly API_PORT
   INTERNAL_API_PORT="$(get_free_random_port)"
   readonly INTERNAL_API_PORT
-  run_step "Checking the key port range" check_port_ranges
   readonly ACCESS_CONFIG="${ACCESS_CONFIG:-${SHADOWBOX_DIR}/access.txt}"
   readonly SB_IMAGE="${SB_IMAGE:-quay.io/outline/shadowbox:stable}"
+  readonly GUARD_IMAGE="${GUARD_IMAGE:-golang:1.23-alpine}"
+  readonly GUARD_DIR="${GUARD_DIR:-${SHADOWBOX_DIR}/guard}"
+  readonly GUARD_BIN="${GUARD_DIR}/outline-ss-server"
 
   PUBLIC_HOSTNAME="${FLAGS_HOSTNAME:-${SB_PUBLIC_IP:-}}"
   if [[ -z "${PUBLIC_HOSTNAME}" ]]; then
@@ -1999,21 +2149,17 @@ install_shadowbox() {
 
   # Make a directory for persistent state
   run_step "Creating persistent state dir" create_persisted_state_dir
+  run_step "Building the device guard (patched outline-ss-server, first run takes a few minutes)" prepare_guard
+  run_step "Removing old port-per-key firewall rules (if any)" remove_v1_firewall
   run_step "Generating secret key" generate_secret_key
   run_step "Generating TLS certificate" generate_certificate
   run_step "Generating SHA-256 certificate fingerprint" generate_certificate_fingerprint
   run_step "Writing config" write_config
   run_step "Writing key panel files" write_panel_files
-  run_step "Opening ports (ufw / firewalld if active)" open_key_ports
-  run_step "Starting key panel firewall" start_panel_firewall
 
-  # TODO(dborkan): if the script fails after docker run, it will continue to fail
-  # as the names shadowbox and watchtower will already be in use.  Consider
-  # deleting the container in the case of failure (e.g. using a trap, or
-  # deleting existing containers on each run).
+  # Watchtower is not started (see the header), and one left by an earlier install is removed.
+  run_step "Disabling automatic image updates" disable_watchtower
   run_step "Starting Shadowbox" start_shadowbox
-  # TODO(fortuna): Don't wait for Shadowbox to run this.
-  run_step "Starting Watchtower" start_watchtower
 
   readonly PUBLIC_API_URL="https://${PUBLIC_HOSTNAME}:${API_PORT}/${SB_API_PREFIX}"
   readonly LOCAL_API_URL="https://localhost:${API_PORT}/${SB_API_PREFIX}"
@@ -2022,6 +2168,8 @@ install_shadowbox() {
   run_step "Starting key panel" start_panel
   run_step "Waiting for key panel" wait_panel
   run_step "Creating first user" create_first_user
+  run_step "Reading the shared key port" read_keys_port
+  run_step "Opening ports (ufw / firewalld if active)" open_ports
   run_step "Adding API URL to config" add_api_url_to_config
 
   FIREWALL_STATUS=""
@@ -2049,7 +2197,8 @@ $(echo -e "\033[1;32m{\"apiUrl\":\"$(get_field_value apiUrl)\",\"certSha256\":\"
 
 Key panel (usage, time limit, pause, edit, one device per key) is running as the service outline-panel:
 - API:      GET ${PUBLIC_API_URL}/access-keys   (same URL and certificate as Outline Manager uses)
-- Key ports: ${PORT_RANGE_START}-${PORT_RANGE_END}, one per key
+- Key port: ${KEYS_PORT} (TCP + UDP), shared by all keys
+- Guard:    outline-ss-server ${SS_VERSION} + device guard (${GUARD_BIN})
 - Logs:     journalctl -u outline-panel -f
 - Settings: vi ${PANEL_DIR}/config.json   (then: systemctl restart outline-panel)
 
@@ -2087,10 +2236,10 @@ function escape_json_string() {
   done
 }
 
-# Usage: parse_flags "$@" -> reads --hostname, --api-port, --keys-port and --port-range into FLAGS_*
+# Usage: parse_flags "$@" -> reads --hostname, --api-port and --keys-port into FLAGS_*
 function parse_flags() {
   local params
-  params="$(getopt --longoptions hostname:,api-port:,keys-port:,port-range: -n "$0" -- "$0" "$@")"
+  params="$(getopt --longoptions hostname:,api-port:,keys-port: -n "$0" -- "$0" "$@")"
   eval set -- "${params}"
 
   while (( $# > 0 )); do
@@ -2117,14 +2266,6 @@ function parse_flags() {
           exit 1
         fi
         ;;
-      --port-range)
-        FLAGS_PORT_RANGE=$1
-        shift
-        if [[ ! "${FLAGS_PORT_RANGE}" =~ ^[0-9]+-[0-9]+$ ]]; then
-          log_error "Invalid value for ${flag}: ${FLAGS_PORT_RANGE} (use <first>-<last>, e.g. 20000-20999)" >&2
-          exit 1
-        fi
-        ;;
       --)
         break
         ;;
@@ -2142,13 +2283,12 @@ function parse_flags() {
   return 0
 }
 
-# Usage: main "$@" -> installs the Outline server, Watchtower and the key panel
+# Usage: main "$@" -> installs the Outline server, the device guard and the key panel
 function main() {
   trap finish EXIT
   declare FLAGS_HOSTNAME=""
   declare -i FLAGS_API_PORT=0
   declare -i FLAGS_KEYS_PORT=0
-  declare FLAGS_PORT_RANGE=""
   parse_flags "$@"
   install_shadowbox
 }
